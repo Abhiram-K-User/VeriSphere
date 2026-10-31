@@ -3,12 +3,14 @@ import { AuditReport } from '@verisphere/shared-types';
 
 export class GroqAIProvider {
   private groq: Groq;
+  private model: string;
 
   constructor() {
     // Requires GROQ_API_KEY environment variable to be set
     this.groq = new Groq({
       apiKey: process.env.GROQ_API_KEY,
     });
+    this.model = process.env.GROQ_MODEL || 'openai/gpt-oss-120b';
   }
 
   public async analyzeCandidate(resumeText: string, githubMetrics: any, systemPrompt: string): Promise<Partial<AuditReport>> {
@@ -28,7 +30,7 @@ export class GroqAIProvider {
           { role: 'system', content: systemPrompt },
           { role: 'user', content: userPrompt }
         ],
-        model: 'llama-3.3-70b-versatile',
+        model: this.model,
         temperature: 0.1,
         response_format: { type: 'json_object' }
       });
@@ -89,7 +91,7 @@ Do not include any other text outside the JSON.
           { role: 'system', content: systemPrompt },
           { role: 'user', content: userPrompt }
         ],
-        model: 'llama-3.3-70b-versatile',
+        model: this.model,
         temperature: 0.1,
         response_format: { type: 'json_object' }
       });

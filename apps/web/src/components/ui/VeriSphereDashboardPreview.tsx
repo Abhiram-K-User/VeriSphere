@@ -622,7 +622,7 @@ export function VeriSphereDashboardPreview() {
                       <div className="flex flex-wrap gap-2">
                         {(liveData?.skills || ["React", "TypeScript", "Node.js"]).map((s, i) => (
                           <motion.div
-                            key={s}
+                            key={`${s}-${i}`}
                             initial={{ opacity: 0, scale: 0.85, x: -6 }}
                             animate={showGauge ? { opacity: 1, scale: 1, x: 0 } : {}}
                             transition={{ duration: 0.3, delay: 1.8 + i * 0.12, type: "spring", stiffness: 300 }}

@@ -1,0 +1,213 @@
+// PROPOSED schema (not applied). Target of Phase 1 in DBMS_NOSQL_UPGRADE.md.
+// Live schema: packages/shared-config/prisma/schema.prisma
+// CHECK constraints, triggers, views and roles are raw SQL (see Phase 2); Prisma cannot express them.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+enum JobStatus {
+  QUEUED
+  ANALYZING
+  COMPLETED
+  FAILED
+}
+
+enum Severity {
+  LOW
+  MEDIUM
+  HIGH
+}
+
+enum SkillSource {
+  RESUME
+  GITHUB
+  CERTIFICATE
+}
+
+enum Role {
+  ADMIN
+  RECRUITER
+  VIEWER
+}
+
+model Institution {
+  id          String      @id @default(uuid())
+  name        String
+  emailDomain String      @unique
+  accredited  Boolean     @default(false)
+  country     String
+  candidates  Candidate[]
+  educations  Education[]
+}
+
+model Candidate {
+  id                 String            @id @default(uuid())
+  firstName          String
+  lastName           String
+  email              String            @unique
+  institutionalEmail String?
+  phone              String?
+  githubUrl          String?
+  institutionId      String?
+  createdAt          DateTime          @default(now())
+  institution        Institution?      @relation(fields: [institutionId], references: [id], onDelete: SetNull)
+  educations         Education[]
+  certificates       Certificate[]
+  githubProfile      GithubProfile?
+  skills             CandidateSkill[]
+  jobs               VerificationJob[]
+
+  @@index([institutionId])
+}
+
+model Education {
+  id            String      @id @default(uuid())
+  candidateId   String
+  institutionId String
+  degree        String
+  cgpa          Decimal?    @db.Decimal(4, 2) // CHECK (cgpa BETWEEN 0 AND 10)
+  startYear     Int
+  endYear       Int? // CHECK (endYear >= startYear)
+  candidate     Candidate   @relation(fields: [candidateId], references: [id], onDelete: Cascade)
+  institution   Institution @relation(fields: [institutionId], references: [id])
+
+  @@index([candidateId])
+  @@index([institutionId])
+}
+
+model Certificate {
+  id           String    @id @default(uuid())
+  candidateId  String
+  issuer       String
+  credentialId String?
+  issuedOn     DateTime?
+  verified     Boolean   @default(false)
+  candidate    Candidate @relation(fields: [candidateId], references: [id], onDelete: Cascade)
+
+  @@unique([issuer, credentialId])
+  @@index([candidateId])
+}
+
+model GithubProfile {
+  id           String       @id @default(uuid())
+  candidateId  String       @unique
+  username     String
+  publicRepos  Int          @default(0)
+  followers    Int          @default(0)
+  fetchedAt    DateTime     @default(now())
+  candidate    Candidate    @relation(fields: [candidateId], references: [id], onDelete: Cascade)
+  repositories Repository[]
+}
+
+model Repository {
+  id              String        @id @default(uuid())
+  profileId       String
+  name            String
+  primaryLanguage String?
+  commitCount     Int           @default(0)
+  lastPushedAt    DateTime?
+  profile         GithubProfile @relation(fields: [profileId], references: [id], onDelete: Cascade)
+
+  @@unique([profileId, name])
+  @@index([profileId])
+}
+
+model Skill {
+  id         String           @id @default(uuid())
+  name       String           @unique
+  category   String?
+  candidates CandidateSkill[]
+}
+
+model CandidateSkill {
+  candidateId String
+  skillId     String
+  source      SkillSource
+  proficiency Int // CHECK (proficiency BETWEEN 1 AND 5)
+  candidate   Candidate   @relation(fields: [candidateId], references: [id], onDelete: Cascade)
+  skill       Skill       @relation(fields: [skillId], references: [id], onDelete: Cascade)
+
+  @@id([candidateId, skillId, source])
+  @@index([skillId])
+}
+
+model VerificationJob {
+  id          String       @id @default(uuid())
+  candidateId String
+  status      JobStatus    @default(QUEUED)
+  startedAt   DateTime     @default(now())
+  completedAt DateTime?
+  createdAt   DateTime     @default(now())
+  errorMsg    String?
+  mongoRef    String? // ObjectId of the evidence manifest in MongoDB
+  candidate   Candidate    @relation(fields: [candidateId], references: [id], onDelete: Cascade)
+  report      AuditReport?
+
+  @@index([candidateId])
+  @@index([status])
+  @@index([status, createdAt])
+}
+
+model AuditReport {
+  id              String          @id @default(uuid())
+  jobId           String          @unique
+  findingsSummary String
+  trustScore      Int // CHECK (trustScore BETWEEN 0 AND 100)
+  prevHash        String?
+  hash            String?
+  createdAt       DateTime        @default(now())
+  job             VerificationJob @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  risks           RiskIndicator[]
+  contradictions  Contradiction[]
+}
+
+model RiskIndicator {
+  id          String      @id @default(uuid())
+  reportId    String
+  type        String
+  severity    Severity
+  description String
+  evidenceRef String? // Mongo document id
+  report      AuditReport @relation(fields: [reportId], references: [id], onDelete: Cascade)
+
+  @@index([reportId])
+}
+
+model Contradiction {
+  id          String      @id @default(uuid())
+  reportId    String
+  description String
+  report      AuditReport @relation(fields: [reportId], references: [id], onDelete: Cascade)
+
+  @@index([reportId])
+}
+
+model AppUser {
+  id           String     @id @default(uuid())
+  email        String     @unique
+  passwordHash String
+  role         Role       @default(RECRUITER)
+  createdAt    DateTime   @default(now())
+  logs         AuditLog[]
+}
+
+model AuditLog {
+  id          String   @id @default(uuid())
+  actorId     String?
+  action      String
+  entity      String
+  entityId    String
+  at          DateTime @default(now())
+  detailsJson Json?
+  actor       AppUser? @relation(fields: [actorId], references: [id], onDelete: SetNull)
+
+  @@index([entity, entityId])
+  @@index([at])
+}
