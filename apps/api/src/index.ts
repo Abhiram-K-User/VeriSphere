@@ -8,10 +8,12 @@ import path from "path";
 // Load environment variables
 dotenv.config({ path: path.resolve(__dirname, "../../../.env") });
 
+import { prisma } from "./infrastructure/db/prisma-client";
 import { createVerificationRouter } from "./infrastructure/routes/verification-routes";
 import { createForensicsRouter } from "./modules/forensics/forensics.routes";
 import { UploadCandidateUseCase } from "./application/use-cases/upload-candidate";
 import { VerificationOrchestrator } from "./application/verification-orchestrator";
+import { mapRelationalJobToLegacyShape } from "./application/services/report-mapper";
 
 const app = express();
 const PORT = process.env.PORT || 4000;
@@ -22,46 +24,72 @@ app.use(express.json({ limit: "50mb" }));
 app.use(express.urlencoded({ limit: "50mb", extended: true }));
 app.use(morgan("combined"));
 
-import { PrismaClient } from '@prisma/client';
-const prisma = new PrismaClient();
-
-// Real Database Implementations for Testing
+// Normalized Relational Repository Implementations
 const mockCandidateRepo = {
-  findById: async (id: string) => null,
-  findByEmail: async (email: string) => null,
+  findById: async (id: string) => prisma.candidate.findUnique({ where: { id } }) as any,
+  findByEmail: async (email: string) =>
+    prisma.candidate.findUnique({ where: { email: email.trim().toLowerCase() } }) as any,
   create: async (c: any) => {
-    const candidate = await prisma.candidate.create({
-      data: {
-        firstName: c.firstName || "John",
-        lastName: c.lastName || "Doe",
-        email: c.email || "test@example.com",
-        institutionalEmail: c.institutionalEmail || null,
-        githubUrl: c.githubUrl || null
-      }
+    const cleanEmail = (c.email || "test@example.com").trim().toLowerCase();
+    const candidate = await prisma.candidate.upsert({
+      where: { email: cleanEmail },
+      update: {
+        firstName: (c.firstName || "John").trim(),
+        lastName: (c.lastName || "Doe").trim(),
+        institutionalEmail: c.institutionalEmail ? c.institutionalEmail.trim() : undefined,
+        phone: c.phone ? c.phone.trim() : undefined,
+        githubUrl: c.githubUrl ? c.githubUrl.trim() : undefined,
+      },
+      create: {
+        firstName: (c.firstName || "John").trim(),
+        lastName: (c.lastName || "Doe").trim(),
+        email: cleanEmail,
+        institutionalEmail: c.institutionalEmail ? c.institutionalEmail.trim() : null,
+        phone: c.phone ? c.phone.trim() : null,
+        githubUrl: c.githubUrl ? c.githubUrl.trim() : null,
+      },
     });
     return candidate as any;
   },
-  listAll: async (org: string) => []
+  listAll: async (org: string) => prisma.candidate.findMany() as any,
 };
 
 const mockJobRepo = {
   findById: async (id: string) => {
-    return prisma.verificationJob.findUnique({
+    const job = await prisma.verificationJob.findUnique({
       where: { id },
-      include: { report: true, candidate: true }
+      include: {
+        report: {
+          include: {
+            riskIndicators: true,
+            contradictionItems: true,
+          },
+        },
+        certificates: true,
+        candidate: {
+          include: {
+            institution: true,
+            educations: { include: { institution: true } },
+            certificates: true,
+            githubProfile: { include: { repositories: true } },
+            skills: { include: { skill: true } },
+          },
+        },
+      },
     });
+    return mapRelationalJobToLegacyShape(job);
   },
   create: async (cId: string) => {
     const job = await prisma.verificationJob.create({
       data: {
         candidateId: cId,
-        status: "QUEUED"
-      }
+        status: "QUEUED",
+      },
     });
     return job as any;
   },
   updateStatus: async (jId: string, status: string, error?: string) => {},
-  saveResults: async () => {}
+  saveResults: async () => {},
 } as any;
 
 const orchestrator = new VerificationOrchestrator();
@@ -81,7 +109,7 @@ app.use((err: any, req: express.Request, res: express.Response, next: express.Ne
   console.error("[Global Error]", err);
   res.status(err.status || 500).json({
     success: false,
-    error: err.message || "Internal Server Error"
+    error: err.message || "Internal Server Error",
   });
 });
 

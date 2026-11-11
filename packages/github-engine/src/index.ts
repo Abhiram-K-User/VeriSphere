@@ -136,10 +136,19 @@ export async function scrapeGithubEvidence(
     return buildEmptyReport(username);
   }
 
+  // In unauthenticated mode (60 req/hr limit), deeply analyze top 6 non-fork recent repos
+  // to avoid exhausting the hourly IP quota on the very first candidate, while still recording
+  // metadata for all remaining repositories.
+  const hasToken = Boolean(process.env.GITHUB_TOKEN && process.env.GITHUB_TOKEN.trim().length > 0);
+  const prioritizedRepos = [...repositories].sort((a, b) => Number(a.isFork) - Number(b.isFork));
+  const deepRepos = hasToken ? prioritizedRepos : prioritizedRepos.slice(0, 6);
+  const deepRepoNames = new Set(deepRepos.map((r) => r.name));
+  const shallowRepos = prioritizedRepos.filter((r) => !deepRepoNames.has(r.name));
+
   // --- Step 3: Language distribution ---
   const languageDistribution = await fetchLanguageDistribution(
     username,
-    repositories,
+    deepRepos,
     octokit
   );
 
@@ -157,8 +166,8 @@ export async function scrapeGithubEvidence(
   }>[] = [];
 
   const limit = 3;
-  for (let i = 0; i < repositories.length; i += limit) {
-    const chunk = repositories.slice(i, i + limit);
+  for (let i = 0; i < deepRepos.length; i += limit) {
+    const chunk = deepRepos.slice(i, i + limit);
     const chunkResults = await Promise.allSettled(
       chunk.map(async (repo) => {
         const [technologies, contributorResult, activityMetrics] =
@@ -210,6 +219,20 @@ export async function scrapeGithubEvidence(
       primaryLanguage: repo.language ?? "Unknown",
       flags: flags.map((f) => f.type),
       recentCommits: activityMetrics.recentCommits,
+    });
+  }
+
+  for (const repo of shallowRepos) {
+    const langTechs = repo.language && repo.language.toLowerCase() !== "unknown" ? [repo.language] : [];
+    langTechs.forEach((t) => allTechSets.add(t));
+    repoEvidence.push({
+      repoName: repo.name,
+      technologies: langTechs,
+      ownershipPercent: 100,
+      totalCommits: 0,
+      primaryLanguage: repo.language ?? "Unknown",
+      flags: [],
+      recentCommits: [],
     });
   }
 

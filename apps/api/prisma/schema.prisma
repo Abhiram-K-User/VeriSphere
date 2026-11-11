@@ -8,30 +8,150 @@ datasource db {
   directUrl = env("DIRECT_URL")
 }
 
+enum JobStatus {
+  QUEUED
+  ANALYZING
+  COMPLETED
+  FAILED
+}
+
+enum Severity {
+  LOW
+  MEDIUM
+  HIGH
+  CRITICAL
+}
+
+enum SkillSource {
+  RESUME
+  GITHUB
+  CERTIFICATE
+}
+
+enum Role {
+  ADMIN
+  RECRUITER
+  VIEWER
+}
+
+model Institution {
+  id          String      @id @default(uuid())
+  name        String
+  emailDomain String      @unique
+  accredited  Boolean     @default(true)
+  country     String      @default("India")
+  candidates  Candidate[]
+  educations  Education[]
+}
+
 model Candidate {
   id                 String            @id @default(uuid())
   firstName          String
   lastName           String
-  email              String
+  email              String            @unique
   institutionalEmail String?
+  phone              String?
   githubUrl          String?
+  institutionId      String?
   createdAt          DateTime          @default(now())
+  institution        Institution?      @relation(fields: [institutionId], references: [id], onDelete: SetNull)
   jobs               VerificationJob[]
+  educations         Education[]
+  certificates       Certificate[]
+  skills             CandidateSkill[]
+  githubProfile      GithubProfile?
+
+  @@index([institutionId])
+}
+
+model Education {
+  id            String       @id @default(uuid())
+  candidateId   String
+  institutionId String?
+  degree        String
+  cgpa          Decimal?     @db.Decimal(4, 2)
+  startYear     Int?
+  endYear       Int?
+  candidate     Candidate    @relation(fields: [candidateId], references: [id], onDelete: Cascade)
+  institution   Institution? @relation(fields: [institutionId], references: [id], onDelete: SetNull)
+
+  @@index([candidateId])
+}
+
+model Certificate {
+  id           String           @id @default(uuid())
+  candidateId  String
+  jobId        String?
+  issuer       String
+  credentialId String?
+  issuedOn     DateTime?
+  verified     Boolean          @default(false)
+  candidate    Candidate        @relation(fields: [candidateId], references: [id], onDelete: Cascade)
+  job          VerificationJob? @relation(fields: [jobId], references: [id], onDelete: SetNull)
+
+  @@index([candidateId])
+}
+
+model GithubProfile {
+  id           String       @id @default(uuid())
+  candidateId  String       @unique
+  username     String
+  publicRepos  Int          @default(0)
+  followers    Int          @default(0)
+  fetchedAt    DateTime     @default(now())
+  candidate    Candidate    @relation(fields: [candidateId], references: [id], onDelete: Cascade)
+  repositories Repository[]
+}
+
+model Repository {
+  id              String        @id @default(uuid())
+  profileId       String
+  name            String
+  primaryLanguage String?
+  commitCount     Int           @default(0)
+  lastPushedAt    DateTime?
+  profile         GithubProfile @relation(fields: [profileId], references: [id], onDelete: Cascade)
+
+  @@index([profileId])
+}
+
+model Skill {
+  id         String           @id @default(uuid())
+  name       String           @unique
+  category   String?
+  candidates CandidateSkill[]
+}
+
+model CandidateSkill {
+  candidateId String      @map("candidateId")
+  skillId     String      @map("skillId")
+  proficiency Int         @default(3)
+  source      SkillSource @default(RESUME)
+  candidate   Candidate   @relation(fields: [candidateId], references: [id], onDelete: Cascade)
+  skill       Skill       @relation(fields: [skillId], references: [id], onDelete: Cascade)
+
+  @@id([candidateId, skillId, source])
 }
 
 model VerificationJob {
-  id                  String       @id @default(uuid())
+  id                  String        @id @default(uuid())
   candidateId         String
-  status              String       @default("QUEUED")
-  startedAt           DateTime     @default(now())
+  status              JobStatus     @default(QUEUED)
+  startedAt           DateTime      @default(now())
   completedAt         DateTime?
   certificateDataJson String?
-  createdAt           DateTime     @default(now())
+  createdAt           DateTime      @default(now())
   errorMsg            String?
   githubMetricsJson   String?
   resumeDataJson      String?
+  mongoRef            String?
   report              AuditReport?
-  candidate           Candidate    @relation(fields: [candidateId], references: [id], onDelete: Cascade)
+  certificates        Certificate[]
+  candidate           Candidate     @relation(fields: [candidateId], references: [id], onDelete: Cascade)
+
+  @@index([candidateId])
+  @@index([status])
+  @@index([status, createdAt])
 }
 
 model AuditReport {
@@ -44,5 +164,51 @@ model AuditReport {
   academicVerificationJson String?
   contradictions           String[]
   trustScore               Int
+  prevHash                 String?
+  hash                     String?
   job                      VerificationJob @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  riskIndicators           RiskIndicator[]
+  contradictionItems       Contradiction[]
+}
+
+model RiskIndicator {
+  id          String      @id @default(uuid())
+  reportId    String
+  type        String
+  severity    Severity    @default(MEDIUM)
+  description String
+  evidenceRef String?
+  report      AuditReport @relation(fields: [reportId], references: [id], onDelete: Cascade)
+
+  @@index([reportId])
+}
+
+model Contradiction {
+  id          String      @id @default(uuid())
+  reportId    String
+  description String
+  report      AuditReport @relation(fields: [reportId], references: [id], onDelete: Cascade)
+
+  @@index([reportId])
+}
+
+model AppUser {
+  id           String   @id @default(uuid())
+  email        String   @unique
+  passwordHash String
+  role         Role     @default(RECRUITER)
+  createdAt    DateTime @default(now())
+}
+
+model AuditLog {
+  id          String   @id @default(uuid())
+  actorId     String?
+  action      String
+  entity      String
+  entityId    String
+  at          DateTime @default(now())
+  detailsJson String?
+
+  @@index([entity, entityId])
+  @@index([at])
 }

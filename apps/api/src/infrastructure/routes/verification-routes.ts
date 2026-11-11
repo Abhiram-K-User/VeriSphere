@@ -10,10 +10,12 @@ import { Router, Request, Response, NextFunction } from "express";
 import { UploadCandidateUseCase } from "../../application/use-cases/upload-candidate";
 import { ValidationError, ResourceNotFoundError } from "../../domain/entities";
 import { authMiddleware } from "../middleware/auth-middleware";
-import { PrismaClient } from "@prisma/client";
+import { mapRelationalJobToLegacyShape } from "../../application/services/report-mapper";
+import { prisma } from "../db/prisma-client";
 import multer from "multer";
 import path from "path";
 import fs from "fs";
+import crypto from "crypto";
 
 // Ensure uploads directory exists
 const uploadDir = path.join(__dirname, "../../../../uploads");
@@ -26,7 +28,23 @@ const upload = multer({
   storage: multer.memoryStorage()
 });
 
-const prisma = new PrismaClient();
+function normalizeGithubUrl(rawUsername?: string, rawUrl?: string): string | undefined {
+  const input = (rawUsername || rawUrl || "").trim();
+  if (!input) return undefined;
+
+  // Strip protocol, github.com prefix, leading @, query/hash, and trailing slashes
+  const username = input
+    .replace(/^https?:\/\/(www\.)?github\.com\//i, "")
+    .replace(/^(www\.)?github\.com\//i, "")
+    .replace(/^@/, "")
+    .replace(/[?#].*$/, "")
+    .replace(/\/+$/, "")
+    .split("/")[0]
+    .trim();
+
+  if (!username) return undefined;
+  return `https://github.com/${username}`;
+}
 
 export function createVerificationRouter(
   uploadCandidateUseCase: UploadCandidateUseCase,
@@ -43,9 +61,8 @@ export function createVerificationRouter(
    */
   router.post("/intake", upload.single("resumeFile"), async (req: Request, res: Response, next: NextFunction) => {
     try {
-      // req.body contains text fields, req.file contains the uploaded file
-      const githubUrl = req.body.githubUsername ? `https://github.com/${req.body.githubUsername}` : req.body.githubUrl;
-      
+      const githubUrl = normalizeGithubUrl(req.body.githubUsername, req.body.githubUrl);
+
       // Parse certificateAnalyses if provided as JSON string in FormData
       let certificateAnalyses: any[] = [];
       if (req.body.certificateAnalyses) {
@@ -59,7 +76,7 @@ export function createVerificationRouter(
       const candidateData = {
         ...req.body,
         githubUrl,
-        resumeFileUrl: "", // Deprecated: using memory buffer instead
+        resumeFileUrl: "",
         resumeBuffer: req.file ? req.file.buffer : undefined,
         certificateUrls: [],
         certificateAnalyses
@@ -104,8 +121,6 @@ export function createVerificationRouter(
         throw new ResourceNotFoundError("AuditReport", jobId);
       }
 
-      // We dynamically import or instantiate the service
-      // Better to require it here to avoid circular deps if any, or just import it at the top
       const { PdfGeneratorService } = require("../../application/services/pdf-generator");
       const pdfService = new PdfGeneratorService();
       
@@ -113,7 +128,44 @@ export function createVerificationRouter(
 
       res.setHeader("Content-Type", "application/pdf");
       res.setHeader("Content-Disposition", `attachment; filename="VeriSphere_Report_${jobId}.pdf"`);
-      return res.send(pdfBuffer);
+      res.setHeader("Content-Length", pdfBuffer.length);
+      
+      return res.status(200).send(pdfBuffer);
+    } catch (error) {
+      console.error("[PDF Generation Error]:", error);
+      next(error);
+    }
+  });
+
+  /**
+   * GET /api/verification/reports/:reportId/integrity
+   * Recomputes the tamper-evident SHA-256 hash chain for an AuditReport and verifies integrity.
+   */
+  router.get("/reports/:reportId/integrity", async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const { reportId } = req.params;
+      const report = await prisma.auditReport.findUnique({ where: { id: reportId } });
+      if (!report) {
+        throw new ResourceNotFoundError("AuditReport", reportId);
+      }
+
+      const canonicalPayload = JSON.stringify({
+        prevHash: report.prevHash || null,
+        jobId: report.jobId,
+        trustScore: report.trustScore,
+        findingsSummary: report.findingsSummary
+      });
+      const recomputedHash = crypto.createHash("sha256").update(canonicalPayload).digest("hex");
+      const valid = report.hash === recomputedHash;
+
+      return res.status(200).json({
+        reportId: report.id,
+        jobId: report.jobId,
+        prevHash: report.prevHash,
+        storedHash: report.hash,
+        recomputedHash,
+        integrityVerified: valid
+      });
     } catch (error) {
       next(error);
     }
@@ -121,7 +173,7 @@ export function createVerificationRouter(
 
   /**
    * GET /api/verification/dashboard
-   * Returns all recent verification jobs with their candidates and reports for the dashboard.
+   * Returns all recent verification jobs with their candidates and normalized relations for the dashboard.
    */
   router.get("/dashboard", async (req: Request, res: Response, next: NextFunction) => {
     try {
@@ -129,11 +181,25 @@ export function createVerificationRouter(
         orderBy: { startedAt: "desc" },
         take: 50,
         include: {
-          candidate: true,
-          report: true
+          candidate: {
+            include: {
+              institution: true,
+              educations: true,
+              certificates: true,
+              githubProfile: { include: { repositories: true } },
+              skills: { include: { skill: true } }
+            }
+          },
+          certificates: true,
+          report: {
+            include: {
+              riskIndicators: true,
+              contradictionItems: true
+            }
+          }
         }
       });
-      return res.status(200).json(jobs);
+      return res.status(200).json(jobs.map(mapRelationalJobToLegacyShape));
     } catch (error) {
       next(error);
     }
