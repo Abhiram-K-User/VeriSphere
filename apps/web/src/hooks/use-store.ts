@@ -28,6 +28,7 @@ interface VerisphereState {
   dashboardJobs: any[];
   dashboardBatches: CachedBatchSummary[];
   dashboardLoaded: boolean;
+  dashboardLastFetchedAt: number;
 
   // Dashboard UI Filters
   searchQuery: string;
@@ -48,13 +49,19 @@ export const useVerisphereStore = create<VerisphereState>((set) => ({
   dashboardJobs: [],
   dashboardBatches: [],
   dashboardLoaded: false,
+  dashboardLastFetchedAt: 0,
   searchQuery: "",
   statusFilter: "ALL",
 
   setCandidates: (candidates) => set({ candidates }),
   setActiveJob: (activeJob) => set({ activeJob }),
   setDashboardData: (dashboardJobs, dashboardBatches) =>
-    set({ dashboardJobs, dashboardBatches, dashboardLoaded: true }),
+    set({
+      dashboardJobs,
+      dashboardBatches,
+      dashboardLoaded: true,
+      dashboardLastFetchedAt: Date.now(),
+    }),
   setSearchQuery: (searchQuery) => set({ searchQuery }),
   setStatusFilter: (statusFilter) => set({ statusFilter }),
   resetFilters: () => set({ searchQuery: "", statusFilter: "ALL" }),

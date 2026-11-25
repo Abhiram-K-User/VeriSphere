@@ -124,6 +124,32 @@ const REPOS_BATCH_QUERY = `
   }
 `;
 
+async function graphqlRequestWithRetry(
+  octokit: Octokit,
+  query: string,
+  variables: Record<string, any>
+): Promise<any> {
+  let lastErr: any = null;
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      return await octokit.request("POST /graphql", { query, variables });
+    } catch (err: any) {
+      lastErr = err;
+      const status = err?.status;
+      const isTransient = status === 502 || status === 503 || status === 504 || status === 500;
+      if (isTransient && attempt < 2) {
+        console.warn(
+          `[github-engine] Transient GraphQL ${status} for @${variables.login || "user"}; retrying once in 1s...`
+        );
+        await new Promise((r) => setTimeout(r, 1000));
+        continue;
+      }
+      throw err;
+    }
+  }
+  throw lastErr;
+}
+
 export async function scrapeGithubViaGraphQL(
   username: string,
   octokit: Octokit
@@ -131,9 +157,8 @@ export async function scrapeGithubViaGraphQL(
   const startTime = Date.now();
 
   // 1. Fetch user node ID and account createdAt in 1 tiny call
-  const metaRes: any = await octokit.request("POST /graphql", {
-    query: USER_META_QUERY,
-    variables: { login: username },
+  const metaRes: any = await graphqlRequestWithRetry(octokit, USER_META_QUERY, {
+    login: username,
   });
 
   const userNode = metaRes?.data?.data?.user;
@@ -155,9 +180,10 @@ export async function scrapeGithubViaGraphQL(
 
   while (pages < 4) {
     pages++;
-    const reposRes: any = await octokit.request("POST /graphql", {
-      query: REPOS_BATCH_QUERY,
-      variables: { login: username, authorId, after: cursor },
+    const reposRes: any = await graphqlRequestWithRetry(octokit, REPOS_BATCH_QUERY, {
+      login: username,
+      authorId,
+      after: cursor,
     });
 
     const repoConn = reposRes?.data?.data?.user?.repositories;

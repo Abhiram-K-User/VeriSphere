@@ -122,10 +122,13 @@ function DashboardContent() {
     dashboardJobs,
     dashboardBatches,
     dashboardLoaded,
+    dashboardLastFetchedAt,
     setDashboardData,
   } = useVerisphereStore();
 
-  const [apiKey, setApiKey] = useState<string | null>(null);
+  const [apiKey, setApiKey] = useState<string | null>(() =>
+    typeof window !== "undefined" ? localStorage.getItem("verisphere_api_key") : null
+  );
   const [selectedBatchId, setSelectedBatchId] = useState<string | null>(initialBatchParam);
   const [batchScopedJobs, setBatchScopedJobs] = useState<any[] | null>(null);
   const [loading, setLoading] = useState(!dashboardLoaded);
@@ -142,7 +145,7 @@ function DashboardContent() {
     }
   }, [initialBatchParam]);
 
-  // Single deduplicated fetch on mount (stale-while-revalidate using Zustand cache)
+  // Single deduplicated fetch on mount (instant render from Zustand cache + skip redundant refetch within 15s unless jobs are active)
   useEffect(() => {
     const key = localStorage.getItem("verisphere_api_key");
     if (!key && !authLoading && !user) {
@@ -152,10 +155,20 @@ function DashboardContent() {
     const effectiveKey = key || (user ? "demo-api-key-1234" : null);
     if (!effectiveKey) return;
     if (!key) localStorage.setItem("verisphere_api_key", effectiveKey);
-    setApiKey(effectiveKey);
+    if (apiKey !== effectiveKey) setApiKey(effectiveKey);
 
     if (didFetchRef.current) return;
     didFetchRef.current = true;
+
+    const hasInFlightJobs = dashboardJobs.some(
+      (j) => j.status === "ANALYZING" || j.status === "QUEUED" || j.status === "DOWNLOADING"
+    );
+    const cacheFresh =
+      dashboardLoaded && !hasInFlightJobs && Date.now() - dashboardLastFetchedAt < 15_000;
+    if (cacheFresh) {
+      setLoading(false);
+      return;
+    }
 
     Promise.all([
       fetch("http://localhost:4000/api/verification/dashboard", {
@@ -174,7 +187,16 @@ function DashboardContent() {
         setLoading(false);
       })
       .catch(() => setLoading(false));
-  }, [router, authLoading, user, setDashboardData]);
+  }, [
+    router,
+    authLoading,
+    user,
+    apiKey,
+    dashboardLoaded,
+    dashboardLastFetchedAt,
+    dashboardJobs,
+    setDashboardData,
+  ]);
 
   // Fetch exact batch records when a specific batch card is selected
   useEffect(() => {

@@ -2,7 +2,8 @@
  * @file token-bucket.ts
  * @package @verisphere/ai-layer
  * @purpose Smooth token-bucket pacer for LLM providers with strict TPM limits (e.g., Groq free tier 8,000 TPM).
- *          Prevents concurrent batch verification jobs from slamming the API in the same second and hitting 429/413.
+ *          Supports instant availability probing (`tryAcquire`) so the multi-model/multi-provider
+ *          dispatcher can immediately route to another free bucket with 0ms wait instead of stalling.
  */
 
 export class TokenBucketLimiter {
@@ -28,8 +29,39 @@ export class TokenBucketLimiter {
   }
 
   public estimateTokens(text: string): number {
-    // Conservative ~3.5 chars/token + ~700 output token headroom
-    return Math.min(this.capacity - 200, Math.ceil((text || "").length / 3.5) + 700);
+    // Conservative ~3.6 chars/token + ~650 output token headroom
+    return Math.min(this.capacity - 200, Math.ceil((text || "").length / 3.6) + 650);
+  }
+
+  /**
+   * Non-blocking check & deduction: returns true immediately if enough tokens are available right now.
+   */
+  public tryAcquire(cost: number): boolean {
+    const boundedCost = Math.min(Math.max(cost, 500), this.capacity);
+    this.refill();
+    if (this.tokens >= boundedCost) {
+      this.tokens -= boundedCost;
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * Returns estimated milliseconds until `cost` tokens will be available.
+   */
+  public estimatedWaitMs(cost: number): number {
+    const boundedCost = Math.min(Math.max(cost, 500), this.capacity);
+    this.refill();
+    if (this.tokens >= boundedCost) return 0;
+    return Math.ceil((boundedCost - this.tokens) / this.refillPerMs);
+  }
+
+  /**
+   * Marks this bucket as temporarily depleted (e.g., after an upstream 429).
+   */
+  public markDepleted(): void {
+    this.tokens = 0;
+    this.lastRefillTime = Date.now();
   }
 
   public async acquire(cost: number): Promise<void> {

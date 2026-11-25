@@ -1,5 +1,6 @@
 import Groq from 'groq-sdk';
 import { AuditReport } from '@verisphere/shared-types';
+import { TokenBucketLimiter } from './token-bucket';
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -18,7 +19,8 @@ function compactResumeText(raw: string, maxChars: number): string {
 /**
  * Compacts githubMetrics for LLM input WITHOUT dropping any repositories (including forks).
  * Removes whitespace indentation and verbose commit payloads so requests stay well under
- * Groq's free-tier TPM budget (8,000 TPM) while preserving 100% of repos, languages, and skills.
+ * Groq's free-tier per-model TPM budget (8,000 TPM per model) while preserving 100% of repos,
+ * languages, and skills.
  */
 function compactGithubMetrics(metrics: any, ultraCompact: boolean = false): any {
   if (!metrics || typeof metrics !== 'object') return metrics;
@@ -59,49 +61,117 @@ function compactGithubMetrics(metrics: any, ultraCompact: boolean = false): any 
   };
 }
 
+/**
+ * Each Groq model has its own independent 8,000 TPM free-tier quota bucket!
+ * Pooling all 3 models triples Groq's free-tier throughput to 24,000 TPM (0ms waits on 5-candidate batches).
+ */
+const DEFAULT_GROQ_MODELS = [
+  'openai/gpt-oss-120b',
+  'qwen/qwen3.8-27b',
+  'openai/gpt-oss-20b',
+];
+
+const modelBuckets = new Map<string, TokenBucketLimiter>();
+function getBucketForModel(model: string): TokenBucketLimiter {
+  let bucket = modelBuckets.get(model);
+  if (!bucket) {
+    bucket = new TokenBucketLimiter(7200);
+    modelBuckets.set(model, bucket);
+  }
+  return bucket;
+}
+
 export class GroqAIProvider {
   private groq: Groq;
-  private model: string;
+  private models: string[];
 
   constructor() {
     this.groq = new Groq({
       apiKey: process.env.GROQ_API_KEY,
     });
-    this.model = process.env.GROQ_MODEL || 'openai/gpt-oss-120b';
+    const configured = process.env.GROQ_MODEL?.trim();
+    this.models = configured
+      ? [configured, ...DEFAULT_GROQ_MODELS.filter((m) => m !== configured)]
+      : [...DEFAULT_GROQ_MODELS];
+  }
+
+  /**
+   * Returns true if ANY Groq model bucket currently has immediate capacity for `estimatedTokens`.
+   */
+  public hasImmediateCapacity(estimatedTokens: number): boolean {
+    return this.models.some((m) => getBucketForModel(m).estimatedWaitMs(estimatedTokens) === 0);
+  }
+
+  /**
+   * Selects the best Groq model right now: prefers one with 0ms wait, otherwise picks the one
+   * with the shortest wait time, and acquires its bucket tokens.
+   */
+  private async acquireBestModel(estimatedTokens: number, excludeModels: Set<string>): Promise<string> {
+    const candidates = this.models.filter((m) => !excludeModels.has(m));
+    const pool = candidates.length > 0 ? candidates : this.models;
+
+    // 1. Try instant zero-wait acquisition first
+    for (const model of pool) {
+      if (getBucketForModel(model).tryAcquire(estimatedTokens)) {
+        return model;
+      }
+    }
+
+    // 2. Otherwise pick the model with the lowest wait time
+    let bestModel = pool[0];
+    let lowestWait = getBucketForModel(bestModel).estimatedWaitMs(estimatedTokens);
+    for (let i = 1; i < pool.length; i++) {
+      const wait = getBucketForModel(pool[i]).estimatedWaitMs(estimatedTokens);
+      if (wait < lowestWait) {
+        lowestWait = wait;
+        bestModel = pool[i];
+      }
+    }
+
+    await getBucketForModel(bestModel).acquire(estimatedTokens);
+    return bestModel;
   }
 
   private async callWithRetry(
     messages: Array<{ role: 'system' | 'user'; content: string }>,
     buildUltraCompactUserPrompt?: () => string
   ): Promise<string> {
-    const maxAttempts = 4;
+    const maxAttempts = 5;
     let currentMessages = messages;
+    const rateLimitedModels = new Set<string>();
+    const totalChars = messages.reduce((sum, m) => sum + m.content.length, 0);
+    const estTokens = Math.min(3200, Math.ceil(totalChars / 3.6) + 650);
 
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      const model = await this.acquireBestModel(estTokens, rateLimitedModels);
+
       try {
+        const started = Date.now();
+        console.log(`[Groq AI] Sending compact request to ${model}...`);
         const completion = await this.groq.chat.completions.create({
           messages: currentMessages,
-          model: this.model,
+          model,
           temperature: 0.1,
           response_format: { type: 'json_object' },
         });
 
         const resultString = completion.choices[0]?.message?.content;
         if (!resultString) {
-          throw new Error('Groq returned empty response');
+          throw new Error(`Groq (${model}) returned empty response`);
         }
+        console.log(`[Groq AI] ✅ ${model} completed in ${Date.now() - started}ms`);
         return resultString;
       } catch (error: any) {
         const status = error?.status;
         const retryAfterHeader = error?.headers?.['retry-after'];
         const isPayloadTooLarge = status === 413;
         const isRateLimited = status === 429;
+        const isModelUnavailable = status === 404 || status === 503 || status === 500;
 
-        if ((isPayloadTooLarge || isRateLimited) && attempt < maxAttempts) {
-          // On 413 (request exceeds TPM limit), immediately shrink payload further
+        if ((isPayloadTooLarge || isRateLimited || isModelUnavailable) && attempt < maxAttempts) {
           if (isPayloadTooLarge && buildUltraCompactUserPrompt) {
             console.warn(
-              `[Groq AI] 413 payload too large on attempt ${attempt}; switching to ultra-compact payload...`
+              `[Groq AI] 413 payload too large on ${model}; switching to ultra-compact payload...`
             );
             currentMessages = [
               currentMessages[0],
@@ -109,15 +179,30 @@ export class GroqAIProvider {
             ];
           }
 
+          if (isRateLimited || isModelUnavailable) {
+            getBucketForModel(model).markDepleted();
+            rateLimitedModels.add(model);
+          }
+
+          // If another Groq model bucket is still untested, switch to it immediately with 0ms delay!
+          const hasUntestedModel = this.models.some((m) => !rateLimitedModels.has(m));
+          if (hasUntestedModel && !isPayloadTooLarge) {
+            console.warn(
+              `[Groq AI] ${model} returned ${status}; immediately rotating to another Groq model bucket...`
+            );
+            continue;
+          }
+
           const retryAfterSec = retryAfterHeader ? parseFloat(String(retryAfterHeader)) : NaN;
           const waitMs = !isNaN(retryAfterSec)
-            ? Math.min(Math.max(retryAfterSec * 1000, 1500), 15000)
-            : Math.min(2500 * attempt, 12000);
+            ? Math.min(Math.max(retryAfterSec * 1000, 1500), 12000)
+            : Math.min(2000 * attempt, 10000);
 
           console.warn(
             `[Groq AI] Rate limit / TPM (${status}) on attempt ${attempt}/${maxAttempts}. Waiting ${Math.round(waitMs / 1000)}s before retry...`
           );
           await sleep(waitMs);
+          rateLimitedModels.clear();
           continue;
         }
 
@@ -134,8 +219,6 @@ export class GroqAIProvider {
     githubMetrics: any,
     systemPrompt: string
   ): Promise<Partial<AuditReport>> {
-    console.log('[Groq AI] Sending compact analysis request to Groq...');
-
     const buildPrompt = (ultraCompact: boolean) => {
       const trimmedResume = compactResumeText(resumeText, ultraCompact ? 3800 : 6200);
       const compactGit = compactGithubMetrics(githubMetrics, ultraCompact);
@@ -154,8 +237,6 @@ export class GroqAIProvider {
   }
 
   public async generateProfessionalReport(data: any): Promise<any> {
-    console.log('[Groq AI] Generating professional verification report...');
-
     const systemPrompt = `
 You are an expert technical recruiter and auditor. Your task is to generate a professional PDF verification report for a candidate based on the raw JSON data provided.
 The report must be concise, structured, and strictly recruiter-facing. Do not generate markdown tables, just structured JSON that will be injected into a Handlebars PDF template.

@@ -45,5 +45,5 @@ export class VerificationWorkerQueue {
 }
 
 export const verificationQueue = new VerificationWorkerQueue(
-  Number(process.env.VERIFICATION_CONCURRENCY) || 4
+  Number(process.env.VERIFICATION_CONCURRENCY) || 6
 );
