@@ -1,27 +1,42 @@
 /**
  * @file use-store.ts
  * @package apps/web
- * @purpose Defines the Zustand store managing global layout states, active candidate listings, and UI status filters.
- * @dependencies zustand
- * @security None
- * @future_implementation Sync state filters with URL search parameters (using next/navigation) to support back-button states.
+ * @purpose Global Zustand store caching dashboard jobs, batches, and UI filters
+ *          so navigating between tabs renders instantly (0ms) with stale-while-revalidate.
  */
 
 import { create } from "zustand";
 import { Candidate, VerificationJob } from "@verisphere/shared-types";
 
+export interface CachedBatchSummary {
+  id: string;
+  orgEmail?: string | null;
+  label?: string | null;
+  createdAt: string;
+  totalJobs: number;
+  completedCount: number;
+  failedCount: number;
+  analyzingCount: number;
+  avgTrustScore: number | null;
+}
+
 interface VerisphereState {
-  // Candidate listings
   candidates: Candidate[];
   activeJob: VerificationJob | null;
-  
+
+  // Instant dashboard cache across route transitions
+  dashboardJobs: any[];
+  dashboardBatches: CachedBatchSummary[];
+  dashboardLoaded: boolean;
+
   // Dashboard UI Filters
   searchQuery: string;
-  statusFilter: string; // "ALL", "COMPLETED", "FAILED", "ANALYZING"
-  
+  statusFilter: string;
+
   // Actions
   setCandidates: (candidates: Candidate[]) => void;
   setActiveJob: (job: VerificationJob | null) => void;
+  setDashboardData: (jobs: any[], batches: CachedBatchSummary[]) => void;
   setSearchQuery: (query: string) => void;
   setStatusFilter: (filter: string) => void;
   resetFilters: () => void;
@@ -30,12 +45,17 @@ interface VerisphereState {
 export const useVerisphereStore = create<VerisphereState>((set) => ({
   candidates: [],
   activeJob: null,
+  dashboardJobs: [],
+  dashboardBatches: [],
+  dashboardLoaded: false,
   searchQuery: "",
   statusFilter: "ALL",
 
   setCandidates: (candidates) => set({ candidates }),
   setActiveJob: (activeJob) => set({ activeJob }),
+  setDashboardData: (dashboardJobs, dashboardBatches) =>
+    set({ dashboardJobs, dashboardBatches, dashboardLoaded: true }),
   setSearchQuery: (searchQuery) => set({ searchQuery }),
   setStatusFilter: (statusFilter) => set({ statusFilter }),
-  resetFilters: () => set({ searchQuery: "", statusFilter: "ALL" })
+  resetFilters: () => set({ searchQuery: "", statusFilter: "ALL" }),
 }));

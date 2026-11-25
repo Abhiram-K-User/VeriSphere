@@ -1,0 +1,369 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>VeriSphere — Batch Verification Summary</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      color: #111827;
+      background: #FFFFFF;
+      font-size: 10pt;
+      line-height: 1.45;
+    }
+    .page {
+      padding: 28px 34px;
+    }
+    .header {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      border-bottom: 2px solid #1B3A6B;
+      padding-bottom: 14px;
+      margin-bottom: 18px;
+    }
+    .brand {
+      font-size: 20pt;
+      font-weight: 800;
+      color: #1B3A6B;
+      letter-spacing: -0.5px;
+    }
+    .brand-sub {
+      font-size: 8pt;
+      text-transform: uppercase;
+      letter-spacing: 1.2px;
+      color: #6B7280;
+      margin-top: 2px;
+    }
+    .meta-right {
+      text-align: right;
+      font-size: 8.5pt;
+      color: #4B5563;
+    }
+    .meta-right strong {
+      color: #111827;
+    }
+    .badge {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 999px;
+      font-size: 7.5pt;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.4px;
+    }
+    .badge-green { background: #DCFCE7; color: #166534; }
+    .badge-amber { background: #FEF3C7; color: #92400E; }
+    .badge-red { background: #FEE2E2; color: #991B1B; }
+    .badge-blue { background: #DBEAFE; color: #1E40AF; }
+    .badge-gray { background: #F3F4F6; color: #4B5563; }
+
+    .kpi-grid {
+      display: grid;
+      grid-template-columns: repeat(5, 1fr);
+      gap: 10px;
+      margin-bottom: 18px;
+    }
+    .kpi-card {
+      background: #F8FAFC;
+      border: 1px solid #E2E8F0;
+      border-radius: 10px;
+      padding: 12px;
+      text-align: center;
+    }
+    .kpi-value {
+      font-size: 18pt;
+      font-weight: 800;
+      color: #1B3A6B;
+      line-height: 1.1;
+    }
+    .kpi-label {
+      font-size: 7.5pt;
+      text-transform: uppercase;
+      letter-spacing: 0.6px;
+      color: #64748B;
+      margin-top: 4px;
+      font-weight: 600;
+    }
+
+    .section {
+      margin-bottom: 18px;
+    }
+    .section-title {
+      font-size: 10.5pt;
+      font-weight: 700;
+      color: #1B3A6B;
+      text-transform: uppercase;
+      letter-spacing: 0.6px;
+      border-left: 4px solid #2563EB;
+      padding-left: 8px;
+      margin-bottom: 10px;
+    }
+    .summary-box {
+      background: #F8F9FA;
+      border: 1px solid #E5E7EB;
+      border-radius: 10px;
+      padding: 12px 15px;
+      font-size: 9.5pt;
+      color: #374151;
+    }
+
+    .two-col {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 14px;
+      margin-bottom: 18px;
+    }
+    .panel {
+      background: #FFFFFF;
+      border: 1px solid #E5E7EB;
+      border-radius: 10px;
+      padding: 12px 14px;
+    }
+    .panel h4 {
+      font-size: 8.5pt;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      color: #6B7280;
+      margin-bottom: 8px;
+    }
+    .pill-wrap {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 5px;
+    }
+    .pill {
+      background: #EFF6FF;
+      color: #1D4ED8;
+      border: 1px solid #BFDBFE;
+      padding: 2px 8px;
+      border-radius: 6px;
+      font-size: 8pt;
+      font-weight: 600;
+    }
+    .risk-row {
+      display: flex;
+      justify-content: space-between;
+      font-size: 8.5pt;
+      padding: 3px 0;
+      border-bottom: 1px dashed #E5E7EB;
+    }
+    .risk-row:last-child { border-bottom: none; }
+
+    .dist-bar {
+      display: flex;
+      height: 12px;
+      border-radius: 6px;
+      overflow: hidden;
+      background: #E5E7EB;
+      margin-bottom: 8px;
+    }
+    .dist-legend {
+      display: flex;
+      gap: 14px;
+      font-size: 8pt;
+      color: #4B5563;
+      flex-wrap: wrap;
+    }
+    .dot {
+      display: inline-block;
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      margin-right: 4px;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 8.5pt;
+    }
+    thead th {
+      background: #1B3A6B;
+      color: #FFFFFF;
+      text-align: left;
+      padding: 8px 9px;
+      font-size: 7.5pt;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+    tbody td {
+      padding: 8px 9px;
+      border-bottom: 1px solid #E5E7EB;
+      vertical-align: top;
+    }
+    tbody tr:nth-child(even) {
+      background: #F9FAFB;
+    }
+    .cand-name {
+      font-weight: 700;
+      color: #111827;
+    }
+    .cand-sub {
+      font-size: 7.5pt;
+      color: #6B7280;
+    }
+    .score-num {
+      font-size: 11pt;
+      font-weight: 800;
+    }
+    .footer {
+      margin-top: 22px;
+      padding-top: 10px;
+      border-top: 1px solid #E5E7EB;
+      display: flex;
+      justify-content: space-between;
+      font-size: 7.5pt;
+      color: #9CA3AF;
+    }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <!-- Header -->
+    <div class="header">
+      <div>
+        <div class="brand">VeriSphere</div>
+        <div class="brand-sub">Organization Batch Verification Executive Summary</div>
+      </div>
+      <div class="meta-right">
+        <div><strong>Batch:</strong> {{batchDateDay}} · {{batchTime}}</div>
+        {{#if batchLabel}}<div><strong>Label:</strong> {{batchLabel}}</div>{{/if}}
+        {{#if orgEmail}}<div><strong>Organization:</strong> {{orgEmail}}</div>{{/if}}
+        <div><strong>Batch ID:</strong> <span style="font-family: monospace;">{{shortBatchId}}</span></div>
+        <div><strong>Generated:</strong> {{generatedAt}}</div>
+      </div>
+    </div>
+
+    <!-- KPI Cards -->
+    <div class="kpi-grid">
+      <div class="kpi-card">
+        <div class="kpi-value">{{totalCandidates}}</div>
+        <div class="kpi-label">Total Resumes</div>
+      </div>
+      <div class="kpi-card">
+        <div class="kpi-value" style="color: #16A34A;">{{completedCount}}</div>
+        <div class="kpi-label">Completed</div>
+      </div>
+      <div class="kpi-card">
+        <div class="kpi-value" style="color: #2563EB;">{{avgTrustScore}}%</div>
+        <div class="kpi-label">Avg Trust Score</div>
+      </div>
+      <div class="kpi-card">
+        <div class="kpi-value" style="color: #15803D;">{{recommendedCount}}</div>
+        <div class="kpi-label">Strong (≥75)</div>
+      </div>
+      <div class="kpi-card">
+        <div class="kpi-value" style="color: #DC2626;">{{highRiskCount}}</div>
+        <div class="kpi-label">High Risk (&lt;55)</div>
+      </div>
+    </div>
+
+    <!-- Executive Summary Narrative -->
+    <div class="section">
+      <div class="section-title">Executive Batch Overview</div>
+      <div class="summary-box">
+        {{executiveOverview}}
+      </div>
+    </div>
+
+    <!-- Score Distribution -->
+    <div class="section">
+      <div class="section-title">Trust Score Distribution</div>
+      <div class="dist-bar">
+        {{#if pctStrong}}<div style="width: {{pctStrong}}%; background: #16A34A;"></div>{{/if}}
+        {{#if pctModerate}}<div style="width: {{pctModerate}}%; background: #F59E0B;"></div>{{/if}}
+        {{#if pctRisk}}<div style="width: {{pctRisk}}%; background: #DC2626;"></div>{{/if}}
+        {{#if pctOther}}<div style="width: {{pctOther}}%; background: #9CA3AF;"></div>{{/if}}
+      </div>
+      <div class="dist-legend">
+        <span><span class="dot" style="background:#16A34A;"></span>Strong Hire (≥75): <strong>{{recommendedCount}}</strong></span>
+        <span><span class="dot" style="background:#F59E0B;"></span>Review Needed (55–74): <strong>{{moderateCount}}</strong></span>
+        <span><span class="dot" style="background:#DC2626;"></span>High Risk (&lt;55): <strong>{{highRiskCount}}</strong></span>
+        <span><span class="dot" style="background:#9CA3AF;"></span>Failed / Pending: <strong>{{otherCount}}</strong></span>
+      </div>
+    </div>
+
+    <!-- Skills & Common Risks -->
+    <div class="two-col">
+      <div class="panel">
+        <h4>Top Verified Skills Across Batch</h4>
+        {{#if topSkills.length}}
+          <div class="pill-wrap">
+            {{#each topSkills}}
+              <span class="pill">{{this.name}} ({{this.count}})</span>
+            {{/each}}
+          </div>
+        {{else}}
+          <div class="cand-sub">No verified skill records available yet.</div>
+        {{/if}}
+      </div>
+      <div class="panel">
+        <h4>Most Frequent Risk Signals</h4>
+        {{#if topRisks.length}}
+          {{#each topRisks}}
+            <div class="risk-row">
+              <span>{{this.type}}</span>
+              <strong>{{this.count}} candidate(s)</strong>
+            </div>
+          {{/each}}
+        {{else}}
+          <div class="cand-sub">No major risk indicators flagged in this batch.</div>
+        {{/if}}
+      </div>
+    </div>
+
+    <!-- Ranked Candidate Leaderboard -->
+    <div class="section">
+      <div class="section-title">Candidate Verification Leaderboard (Ranked by Trust Score)</div>
+      <table>
+        <thead>
+          <tr>
+            <th style="width: 5%;">#</th>
+            <th style="width: 24%;">Candidate</th>
+            <th style="width: 14%;">GitHub</th>
+            <th style="width: 11%;">Score</th>
+            <th style="width: 13%;">Verdict</th>
+            <th style="width: 33%;">Summary &amp; Risk Notes</th>
+          </tr>
+        </thead>
+        <tbody>
+          {{#each candidates}}
+            <tr>
+              <td><strong>{{this.rank}}</strong></td>
+              <td>
+                <div class="cand-name">{{this.name}}</div>
+                <div class="cand-sub">{{this.email}}</div>
+              </td>
+              <td style="font-family: monospace; font-size: 7.5pt;">{{this.githubHandle}}</td>
+              <td>
+                {{#if this.hasScore}}
+                  <span class="score-num" style="color: {{this.scoreColor}};">{{this.trustScore}}</span><span class="cand-sub">/100</span>
+                {{else}}
+                  <span class="cand-sub">—</span>
+                {{/if}}
+              </td>
+              <td>
+                <span class="badge {{this.verdictClass}}">{{this.verdictLabel}}</span>
+              </td>
+              <td>
+                <div>{{this.summary}}</div>
+                {{#if this.riskCount}}
+                  <div class="cand-sub" style="color: #B45309; margin-top: 2px;">⚠ {{this.riskCount}} risk flag(s)</div>
+                {{/if}}
+              </td>
+            </tr>
+          {{/each}}
+        </tbody>
+      </table>
+    </div>
+
+    <!-- Footer -->
+    <div class="footer">
+      <span>VeriSphere Forensic Hiring Intelligence · Confidential Batch Audit Document</span>
+      <span>Batch Integrity Stamp: {{integrityStamp}}</span>
+    </div>
+  </div>
+</body>
+</html>

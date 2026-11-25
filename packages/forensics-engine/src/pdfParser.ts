@@ -11,6 +11,7 @@ import { ResumeData } from "@verisphere/shared-types";
 
 export interface ParsedPDFLayout {
   rawText: string;
+  links: string[];
   metadata: {
     pageCount: number;
     pdfVersion: string;
@@ -27,46 +28,59 @@ export interface ParsedPDFLayout {
 import { PDFParse } from "pdf-parse";
 
 /**
- * Parses a raw PDF file buffer and returns structured layout text and meta characteristics.
- * 
- * @param pdfBuffer - Raw PDF file buffer uploaded via MultiPart form or fetched from storage.
- * @returns Promise<ParsedPDFLayout>
- * @throws Error if file is corrupted, encrypted with password, or has an invalid header.
+ * Parses a raw PDF file buffer and returns structured layout text, extracted hyperlink
+ * annotations (even from FlateDecode-compressed LaTeX/Overleaf PDFs), and metadata.
  */
 export async function parsePdfBuffer(pdfBuffer: Buffer): Promise<ParsedPDFLayout> {
   if (!pdfBuffer || pdfBuffer.length === 0) {
     throw new Error("Invalid input: pdfBuffer is empty or undefined.");
   }
 
+  const parser = new PDFParse({ data: new Uint8Array(pdfBuffer) });
   try {
-    const parser = new PDFParse({ data: new Uint8Array(pdfBuffer) });
-    const rawTextObj = await parser.getText();
-    const infoResult = await parser.getInfo().catch(() => ({ total: 1, info: {} }));
-    
-    // getText() might return an object with a .text property depending on the fork, or just a string.
+    const [rawTextObj, infoResult] = await Promise.all([
+      parser.getText(),
+      parser.getInfo({ parsePageInfo: true }).catch(() => ({ total: 1, info: {}, pages: [] } as any)),
+    ]);
+
     const rawText = typeof rawTextObj === "string" ? rawTextObj : (rawTextObj as any).text || "";
     const lowerText = rawText.toLowerCase();
-    
-    // Basic heuristics to find sections (rough approximation for demo)
+
+    // Collect all clickable hyperlink URLs from decompressed PDF page annotations
+    const linkSet = new Set<string>();
+    const pages = Array.isArray((infoResult as any)?.pages) ? (infoResult as any).pages : [];
+    for (const page of pages) {
+      if (Array.isArray(page?.links)) {
+        for (const linkObj of page.links) {
+          if (typeof linkObj?.url === "string" && linkObj.url.trim()) {
+            linkSet.add(linkObj.url.trim());
+          }
+        }
+      }
+    }
+
     const skillsIdx = lowerText.indexOf("skills");
     const expIdx = lowerText.indexOf("experience");
     const edIdx = lowerText.indexOf("education");
-    
+
     return {
       rawText: rawText.trim(),
+      links: Array.from(linkSet),
       metadata: {
-        pageCount: infoResult.total || 1,
-        pdfVersion: infoResult.info?.PDFFormatVersion || "1.4",
-        charCount: rawText.length
+        pageCount: (infoResult as any)?.total || 1,
+        pdfVersion: (infoResult as any)?.info?.PDFFormatVersion || "1.4",
+        charCount: rawText.length,
       },
       sections: {
         skillsBlock: skillsIdx !== -1 ? rawText.substring(skillsIdx, skillsIdx + 500) : "",
         experienceBlock: expIdx !== -1 ? rawText.substring(expIdx, expIdx + 1000) : "",
         educationBlock: edIdx !== -1 ? rawText.substring(edIdx, edIdx + 500) : "",
-        projectsBlock: ""
-      }
+        projectsBlock: "",
+      },
     };
   } catch (err: any) {
     throw new Error(`Failed to parse PDF content: ${err.message}`);
+  } finally {
+    await parser.destroy().catch(() => {});
   }
 }

@@ -134,10 +134,30 @@ export function createVerificationRouter(
         }> = [];
         const failedFiles: Array<{ fileName: string; error: string }> = [];
 
-        // 2. Parse each PDF, auto-extract identity, and queue job linked to batch.id
-        for (const file of files) {
+        // 2. Parse all PDFs in parallel (eliminating sequential blocking + duplicate PDF parsing)
+        const parsedResults = await Promise.all(
+          files.map(async (file) => {
+            try {
+              const extracted = await extractIdentityFromResume(file.buffer, file.originalname);
+              return { file, extracted, error: null };
+            } catch (err: any) {
+              return { file, extracted: null, error: err?.message || "Failed to parse PDF" };
+            }
+          })
+        );
+
+        // 3. Upsert candidates and dispatch verification jobs (reusing preParsedText!)
+        for (const item of parsedResults) {
+          if (!item.extracted || item.error) {
+            failedFiles.push({
+              fileName: item.file.originalname,
+              error: item.error || "Failed to parse resume PDF",
+            });
+            continue;
+          }
+
           try {
-            const extracted = await extractIdentityFromResume(file.buffer, file.originalname);
+            const { extracted, file } = item;
             const normalizedGh = normalizeGithubUrl(undefined, extracted.githubUrl);
 
             const result = await uploadCandidateUseCase.execute({
@@ -148,6 +168,7 @@ export function createVerificationRouter(
               githubUrl: normalizedGh,
               resumeFileUrl: "",
               resumeBuffer: file.buffer,
+              preParsedText: extracted.rawText,
               certificateUrls: [],
               certificateAnalyses: [],
               batchId: batch.id,
@@ -163,9 +184,9 @@ export function createVerificationRouter(
               githubUrl: normalizedGh,
             });
           } catch (fileErr: any) {
-            console.error(`[Bulk Intake] Failed for ${file.originalname}:`, fileErr);
+            console.error(`[Bulk Intake] Failed for ${item.file.originalname}:`, fileErr);
             failedFiles.push({
-              fileName: file.originalname,
+              fileName: item.file.originalname,
               error: fileErr?.message || "Failed to process resume PDF",
             });
           }
@@ -254,6 +275,234 @@ export function createVerificationRouter(
   });
 
   /**
+   * GET /api/verification/batches/:batchId/summary/pdf
+   * Generates a comprehensive Executive Batch Verification Summary PDF for Organizations.
+   */
+  router.get(
+    "/batches/:batchId/summary/pdf",
+    async (req: Request, res: Response, next: NextFunction) => {
+      try {
+        const { batchId } = req.params;
+        const batch = await prisma.verificationBatch.findUnique({
+          where: { id: batchId },
+          include: {
+            jobs: {
+              orderBy: { createdAt: "desc" },
+              include: {
+                candidate: {
+                  include: {
+                    skills: { include: { skill: true } },
+                  },
+                },
+                report: {
+                  include: {
+                    riskIndicators: true,
+                  },
+                },
+              },
+            },
+          },
+        });
+
+        if (!batch) {
+          throw new ResourceNotFoundError("VerificationBatch", batchId);
+        }
+
+        const totalCandidates = batch.jobs.length;
+        const completedJobs = batch.jobs.filter((j) => j.status === "COMPLETED");
+        const completedCount = completedJobs.length;
+        const avgTrustScore =
+          completedCount > 0
+            ? Math.round(
+                completedJobs.reduce((acc, j) => acc + (j.report?.trustScore || 0), 0) /
+                  completedCount
+              )
+            : 0;
+
+        const recommendedCount = completedJobs.filter(
+          (j) => (j.report?.trustScore ?? 0) >= 75
+        ).length;
+        const moderateCount = completedJobs.filter((j) => {
+          const s = j.report?.trustScore ?? 0;
+          return s >= 55 && s < 75;
+        }).length;
+        const highRiskCount = completedJobs.filter(
+          (j) => (j.report?.trustScore ?? 0) < 55
+        ).length;
+        const otherCount = totalCandidates - completedCount;
+
+        const denom = Math.max(1, totalCandidates);
+        const pctStrong = Math.round((recommendedCount / denom) * 100);
+        const pctModerate = Math.round((moderateCount / denom) * 100);
+        const pctRisk = Math.round((highRiskCount / denom) * 100);
+        const pctOther = Math.max(0, 100 - pctStrong - pctModerate - pctRisk);
+
+        // Aggregate verified skills across batch
+        const skillCounts = new Map<string, number>();
+        const riskCounts = new Map<string, number>();
+
+        for (const job of batch.jobs) {
+          const seenForCandidate = new Set<string>();
+          for (const cs of job.candidate?.skills || []) {
+            const sName = cs.skill?.name;
+            if (sName && !seenForCandidate.has(sName)) {
+              seenForCandidate.add(sName);
+              skillCounts.set(sName, (skillCounts.get(sName) || 0) + 1);
+            }
+          }
+          const seenRiskTypes = new Set<string>();
+          for (const ri of job.report?.riskIndicators || []) {
+            if (ri.type && !seenRiskTypes.has(ri.type)) {
+              seenRiskTypes.add(ri.type);
+              riskCounts.set(ri.type, (riskCounts.get(ri.type) || 0) + 1);
+            }
+          }
+        }
+
+        const topSkills = Array.from(skillCounts.entries())
+          .sort((a, b) => b[1] - a[1])
+          .slice(0, 12)
+          .map(([name, count]) => ({ name, count }));
+
+        const topRisks = Array.from(riskCounts.entries())
+          .sort((a, b) => b[1] - a[1])
+          .slice(0, 6)
+          .map(([type, count]) => ({ type, count }));
+
+        // Rank candidates by trustScore descending
+        const rankedJobs = [...batch.jobs].sort((a, b) => {
+          const scoreA = a.status === "COMPLETED" ? a.report?.trustScore ?? -1 : -2;
+          const scoreB = b.status === "COMPLETED" ? b.report?.trustScore ?? -1 : -2;
+          return scoreB - scoreA;
+        });
+
+        const candidates = rankedJobs.map((job, idx) => {
+          const hasScore = job.status === "COMPLETED" && job.report?.trustScore != null;
+          const score = job.report?.trustScore ?? 0;
+          let verdictLabel: string = String(job.status);
+          let verdictClass = "badge-gray";
+          let scoreColor = "#6B7280";
+
+          if (hasScore) {
+            if (score >= 75) {
+              verdictLabel = "Strong Hire";
+              verdictClass = "badge-green";
+              scoreColor = "#16A34A";
+            } else if (score >= 55) {
+              verdictLabel = "Review";
+              verdictClass = "badge-amber";
+              scoreColor = "#D97706";
+            } else {
+              verdictLabel = "High Risk";
+              verdictClass = "badge-red";
+              scoreColor = "#DC2626";
+            }
+          } else if (job.status === "FAILED") {
+            verdictLabel = "Failed";
+            verdictClass = "badge-red";
+          } else {
+            verdictLabel = "Analyzing";
+            verdictClass = "badge-blue";
+          }
+
+          const ghHandle = job.candidate?.githubUrl
+            ? "@" + job.candidate.githubUrl.replace(/^https?:\/\/(www\.)?github\.com\//i, "").replace(/\/.*$/, "")
+            : "Not found";
+
+          const summaryText =
+            job.report?.findingsSummary ||
+            (job.status === "FAILED"
+              ? `Verification failed: ${job.errorMsg || "Upstream error"}`
+              : "Verification still processing.");
+
+          return {
+            rank: idx + 1,
+            name: `${job.candidate?.firstName || "Unknown"} ${job.candidate?.lastName || ""}`.trim(),
+            email: job.candidate?.email || "N/A",
+            githubHandle: ghHandle,
+            hasScore,
+            trustScore: score,
+            scoreColor,
+            verdictLabel,
+            verdictClass,
+            summary:
+              summaryText.length > 180 ? summaryText.slice(0, 177) + "..." : summaryText,
+            riskCount: job.report?.riskIndicators?.length || 0,
+          };
+        });
+
+        const batchDate = new Date(batch.createdAt);
+        const batchDateDay = `${batchDate.toLocaleDateString("en-IN", {
+          day: "numeric",
+          month: "short",
+          year: "numeric",
+        })} (${batchDate.toLocaleDateString("en-IN", { weekday: "short" })})`;
+        const batchTime = batchDate.toLocaleTimeString("en-IN", {
+          hour: "2-digit",
+          minute: "2-digit",
+          hour12: true,
+        });
+
+        const topCandidate = candidates.find((c) => c.hasScore);
+        const executiveOverview =
+          completedCount === 0
+            ? `This batch contains ${totalCandidates} candidate resume(s) uploaded on ${batchDateDay}. Verification results are currently pending or incomplete.`
+            : `Out of ${totalCandidates} candidate resume(s) in this batch, ${completedCount} completed forensic verification with an overall average Trust Score of ${avgTrustScore}/100. ${recommendedCount} candidate(s) achieved Strong Hire credibility (≥75), ${moderateCount} require targeted follow-up review (55–74), and ${highRiskCount} were flagged as High Risk (<55).${
+                topCandidate
+                  ? ` Top-ranked candidate: ${topCandidate.name} (${topCandidate.trustScore}/100).`
+                  : ""
+              }`;
+
+        const integrityStamp = crypto
+          .createHash("sha256")
+          .update(`${batch.id}:${completedCount}:${avgTrustScore}`)
+          .digest("hex")
+          .slice(0, 16)
+          .toUpperCase();
+
+        const { PdfGeneratorService } = require("../../application/services/pdf-generator");
+        const pdfService = new PdfGeneratorService();
+        const pdfBuffer = await pdfService.generateBatchSummary({
+          batchDateDay,
+          batchTime,
+          batchLabel: batch.label,
+          orgEmail: batch.orgEmail,
+          shortBatchId: batch.id.slice(0, 8).toUpperCase(),
+          generatedAt: new Date().toLocaleString("en-IN"),
+          totalCandidates,
+          completedCount,
+          avgTrustScore,
+          recommendedCount,
+          moderateCount,
+          highRiskCount,
+          otherCount,
+          pctStrong,
+          pctModerate,
+          pctRisk,
+          pctOther,
+          executiveOverview,
+          topSkills,
+          topRisks,
+          candidates,
+          integrityStamp,
+        });
+
+        const fileDateSlug = batchDate.toISOString().slice(0, 10);
+        res.setHeader("Content-Type", "application/pdf");
+        res.setHeader(
+          "Content-Disposition",
+          `attachment; filename="VeriSphere_Batch_Summary_${fileDateSlug}_${batch.id.slice(0, 6)}.pdf"`
+        );
+        res.setHeader("Content-Length", pdfBuffer.length);
+        return res.status(200).send(pdfBuffer);
+      } catch (error) {
+        console.error("[Batch Summary PDF Error]:", error);
+        next(error);
+      }
+    }
+  );
+
+  /**
    * GET /api/verification/jobs/:jobId/status
    * Returns the full VerificationJob with Candidate and AuditReport for polling and report display.
    */
@@ -337,7 +586,8 @@ export function createVerificationRouter(
 
   /**
    * GET /api/verification/dashboard
-   * Returns recent verification jobs (optionally scoped to a single VerificationBatch via ?batchId=).
+   * Lean projection (~6 KB instead of 1.3 MB!) returning verification summaries for fast dashboard loads.
+   * Full candidate/report payloads remain on GET /api/verification/jobs/:jobId/status.
    */
   router.get("/dashboard", async (req: Request, res: Response, next: NextFunction) => {
     try {
@@ -350,27 +600,33 @@ export function createVerificationRouter(
         where: batchId ? { batchId } : undefined,
         orderBy: { startedAt: "desc" },
         take: batchId ? 200 : 100,
-        include: {
-          batch: true,
+        select: {
+          id: true,
+          candidateId: true,
+          batchId: true,
+          status: true,
+          startedAt: true,
+          completedAt: true,
+          createdAt: true,
+          errorMsg: true,
           candidate: {
-            include: {
-              institution: true,
-              educations: true,
-              certificates: true,
-              githubProfile: { include: { repositories: true } },
-              skills: { include: { skill: true } }
-            }
+            select: {
+              id: true,
+              firstName: true,
+              lastName: true,
+              email: true,
+              githubUrl: true,
+            },
           },
-          certificates: true,
           report: {
-            include: {
-              riskIndicators: true,
-              contradictionItems: true
-            }
-          }
-        }
+            select: {
+              id: true,
+              trustScore: true,
+            },
+          },
+        },
       });
-      return res.status(200).json(jobs.map(mapRelationalJobToLegacyShape));
+      return res.status(200).json(jobs);
     } catch (error) {
       next(error);
     }

@@ -87,4 +87,37 @@ export class PdfGeneratorService {
     
     return Buffer.from(pdfBuffer);
   }
+
+  public async generateBatchSummary(summaryData: any): Promise<Buffer> {
+    const templatePath = path.join(__dirname, '../../templates/batch-summary.hbs');
+    const templateContent = await fs.readFile(templatePath, 'utf-8');
+    const template = handlebars.compile(templateContent);
+    const html = template(summaryData);
+
+    const launchOptions: any = {
+      headless: true,
+      args: ['--no-sandbox', '--disable-setuid-sandbox'],
+    };
+
+    try {
+      await fs.access('C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe');
+      launchOptions.executablePath = 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe';
+    } catch {
+      // Fallback to bundled Puppeteer Chromium
+    }
+
+    const browser = await puppeteer.launch(launchOptions);
+    try {
+      const page = await browser.newPage();
+      await page.setContent(html, { waitUntil: 'load' });
+      const pdfBuffer = await page.pdf({
+        format: 'A4',
+        printBackground: true,
+        margin: { top: '0', bottom: '0', left: '0', right: '0' },
+      });
+      return Buffer.from(pdfBuffer);
+    } finally {
+      await browser.close();
+    }
+  }
 }

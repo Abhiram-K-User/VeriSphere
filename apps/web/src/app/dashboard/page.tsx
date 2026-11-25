@@ -1,9 +1,8 @@
 "use client";
 
-import { useState, useEffect, Suspense } from "react";
+import { useState, useEffect, Suspense, useRef } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import Link from "next/link";
-import { motion, AnimatePresence } from "framer-motion";
 import {
   Search,
   CheckCircle2,
@@ -19,20 +18,11 @@ import {
   Calendar,
   FolderOpen,
   Loader2,
+  FileDown,
 } from "lucide-react";
+import { toast } from "sonner";
 import { useAuth } from "@/components/auth-provider";
-
-interface BatchSummary {
-  id: string;
-  orgEmail?: string | null;
-  label?: string | null;
-  createdAt: string;
-  totalJobs: number;
-  completedCount: number;
-  failedCount: number;
-  analyzingCount: number;
-  avgTrustScore: number | null;
-}
+import { useVerisphereStore, CachedBatchSummary } from "@/hooks/use-store";
 
 function StatusBadge({ status }: { status: string }) {
   const map: Record<string, { color: string; icon: React.ReactNode; label: string }> = {
@@ -74,11 +64,12 @@ function StatusBadge({ status }: { status: string }) {
 
 function ScoreRing({ score }: { score: number }) {
   const color = score >= 75 ? "#10B981" : score >= 50 ? "#F59E0B" : "#EF4444";
+  const circ = 2 * Math.PI * 18;
   return (
     <div className="relative w-12 h-12">
       <svg viewBox="0 0 44 44" className="w-full h-full -rotate-90">
         <circle cx="22" cy="22" r="18" fill="none" stroke="var(--border)" strokeWidth="4" />
-        <motion.circle
+        <circle
           cx="22"
           cy="22"
           r="18"
@@ -86,10 +77,8 @@ function ScoreRing({ score }: { score: number }) {
           stroke={color}
           strokeWidth="4"
           strokeLinecap="round"
-          strokeDasharray={`${2 * Math.PI * 18}`}
-          initial={{ strokeDashoffset: 2 * Math.PI * 18 }}
-          animate={{ strokeDashoffset: 2 * Math.PI * 18 * (1 - score / 100) }}
-          transition={{ duration: 0.9, ease: "easeOut" }}
+          strokeDasharray={`${circ}`}
+          strokeDashoffset={`${circ * (1 - score / 100)}`}
         />
       </svg>
       <div className="absolute inset-0 flex items-center justify-center">
@@ -124,28 +113,36 @@ function formatBatchTitle(isoDate: string): { dateDay: string; time: string } {
 function DashboardContent() {
   const router = useRouter();
   const searchParams = useSearchParams();
+  const initialBatchParam = searchParams.get("batchId");
   const { user, effectiveRole, loading: authLoading } = useAuth();
   const isOrg = effectiveRole === "org" || effectiveRole === "admin";
 
+  // Instant cache from Zustand (0ms render on tab switches)
+  const {
+    dashboardJobs,
+    dashboardBatches,
+    dashboardLoaded,
+    setDashboardData,
+  } = useVerisphereStore();
+
   const [apiKey, setApiKey] = useState<string | null>(null);
-  const [allJobs, setAllJobs] = useState<any[]>([]);
-  const [displayedJobs, setDisplayedJobs] = useState<any[]>([]);
-  const [batches, setBatches] = useState<BatchSummary[]>([]);
-  const [selectedBatchId, setSelectedBatchId] = useState<string | null>(null);
-  const [loading, setLoading] = useState(true);
+  const [selectedBatchId, setSelectedBatchId] = useState<string | null>(initialBatchParam);
+  const [batchScopedJobs, setBatchScopedJobs] = useState<any[] | null>(null);
+  const [loading, setLoading] = useState(!dashboardLoaded);
   const [loadingBatchJobs, setLoadingBatchJobs] = useState(false);
+  const [downloadingBatchId, setDownloadingBatchId] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState("");
   const [statusFilter, setStatusFilter] = useState("ALL");
 
-  // Read initial ?batchId= from URL if present
-  useEffect(() => {
-    const paramBatch = searchParams.get("batchId");
-    if (paramBatch) {
-      setSelectedBatchId(paramBatch);
-    }
-  }, [searchParams]);
+  const didFetchRef = useRef(false);
 
-  // Initial load: all jobs + batches
+  useEffect(() => {
+    if (initialBatchParam) {
+      setSelectedBatchId(initialBatchParam);
+    }
+  }, [initialBatchParam]);
+
+  // Single deduplicated fetch on mount (stale-while-revalidate using Zustand cache)
   useEffect(() => {
     const key = localStorage.getItem("verisphere_api_key");
     if (!key && !authLoading && !user) {
@@ -156,6 +153,9 @@ function DashboardContent() {
     if (!effectiveKey) return;
     if (!key) localStorage.setItem("verisphere_api_key", effectiveKey);
     setApiKey(effectiveKey);
+
+    if (didFetchRef.current) return;
+    didFetchRef.current = true;
 
     Promise.all([
       fetch("http://localhost:4000/api/verification/dashboard", {
@@ -169,37 +169,72 @@ function DashboardContent() {
     ])
       .then(([jobsData, batchesData]) => {
         const list = Array.isArray(jobsData) ? jobsData : [];
-        setAllJobs(list);
-        setBatches(Array.isArray(batchesData) ? batchesData : []);
-        if (!searchParams.get("batchId")) {
-          setDisplayedJobs(list);
-        }
+        const batchList: CachedBatchSummary[] = Array.isArray(batchesData) ? batchesData : [];
+        setDashboardData(list, batchList);
         setLoading(false);
       })
       .catch(() => setLoading(false));
-  }, [router, authLoading, user, searchParams]);
+  }, [router, authLoading, user, setDashboardData]);
 
-  // Fetch exact batch records from DB when a specific batch card is clicked
+  // Fetch exact batch records when a specific batch card is selected
   useEffect(() => {
     if (!apiKey) return;
-
     if (!selectedBatchId) {
-      setDisplayedJobs(allJobs);
+      setBatchScopedJobs(null);
       return;
     }
 
-    setLoadingBatchJobs(true);
+    // Show immediate local filter first (0ms), then confirm from DB
+    const localFiltered = dashboardJobs.filter((j) => j.batchId === selectedBatchId);
+    setBatchScopedJobs(localFiltered);
+
+    setLoadingBatchJobs(localFiltered.length === 0);
     fetch(
       `http://localhost:4000/api/verification/dashboard?batchId=${encodeURIComponent(selectedBatchId)}`,
       { headers: { "x-api-key": apiKey } }
     )
       .then((res) => res.json())
       .then((data) => {
-        setDisplayedJobs(Array.isArray(data) ? data : []);
+        if (Array.isArray(data)) {
+          setBatchScopedJobs(data);
+        }
         setLoadingBatchJobs(false);
       })
       .catch(() => setLoadingBatchJobs(false));
-  }, [selectedBatchId, apiKey, allJobs]);
+  }, [selectedBatchId, apiKey]);
+
+  const handleDownloadBatchSummary = async (batchId: string) => {
+    if (!apiKey) return;
+    setDownloadingBatchId(batchId);
+    const toastId = toast.loading("Generating Executive Batch Summary PDF...");
+    try {
+      const res = await fetch(
+        `http://localhost:4000/api/verification/batches/${encodeURIComponent(batchId)}/summary/pdf`,
+        { headers: { "x-api-key": apiKey } }
+      );
+      if (!res.ok) {
+        throw new Error(`Failed to generate summary PDF (HTTP ${res.status})`);
+      }
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `VeriSphere_Batch_Summary_${batchId.slice(0, 6)}.pdf`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+      toast.success("Batch Summary PDF downloaded!", { id: toastId });
+    } catch (err: any) {
+      toast.error(err?.message || "Could not generate batch summary PDF.", { id: toastId });
+    } finally {
+      setDownloadingBatchId(null);
+    }
+  };
+
+  const allJobs = dashboardJobs;
+  const batches = dashboardBatches;
+  const displayedJobs = selectedBatchId ? batchScopedJobs ?? [] : allJobs;
 
   const filtered = displayedJobs.filter((job) => {
     const name = `${job.candidate?.firstName || ""} ${job.candidate?.lastName || ""}`.toLowerCase();
@@ -210,7 +245,7 @@ function DashboardContent() {
     return matchesSearch && matchesStatus;
   });
 
-  // Top-level Stats (overall)
+  // Top-level Stats
   const completedJobs = allJobs.filter((j) => j.status === "COMPLETED");
   const avgScore =
     completedJobs.length > 0
@@ -271,18 +306,14 @@ function DashboardContent() {
     <div className="min-h-screen bg-[var(--bg-page)]">
       <div className="max-w-7xl mx-auto px-6 py-10">
         {/* Top Row Stats */}
-        <motion.div
-          initial="hidden"
-          animate="visible"
-          variants={{ hidden: {}, visible: { transition: { staggerChildren: 0.06 } } }}
+        <div
           className={`grid grid-cols-2 ${
             isOrg ? "md:grid-cols-5" : "md:grid-cols-4"
           } gap-4 mb-8`}
         >
           {statCards.map((s) => (
-            <motion.div
+            <div
               key={s.label}
-              variants={{ hidden: { opacity: 0, y: 16 }, visible: { opacity: 1, y: 0 } }}
               className="bg-[var(--bg-surface)] border border-[var(--border)] rounded-2xl p-5 shadow-[var(--shadow-sm)]"
             >
               <div className={`w-10 h-10 ${s.bg} rounded-xl flex items-center justify-center mb-3`}>
@@ -290,9 +321,9 @@ function DashboardContent() {
               </div>
               <div className="text-2xl font-bold text-[var(--text-primary)] mb-0.5">{s.value}</div>
               <div className="text-xs text-[var(--text-secondary)]">{s.label}</div>
-            </motion.div>
+            </div>
           ))}
-        </motion.div>
+        </div>
 
         {/* Organization Batch Cards Grid */}
         {isOrg && (
@@ -304,7 +335,7 @@ function DashboardContent() {
                   <span>Verification Batches</span>
                 </h2>
                 <p className="text-xs text-[var(--text-secondary)] mt-0.5">
-                  Select a batch to filter candidates verified in that upload, or choose All Verifications.
+                  Select a batch to filter candidates verified in that upload, or download an executive Batch Summary PDF.
                 </p>
               </div>
               <Link
@@ -317,12 +348,10 @@ function DashboardContent() {
 
             <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-3.5">
               {/* First Card: All Verifications */}
-              <motion.button
+              <button
                 type="button"
-                whileHover={{ y: -2 }}
-                whileTap={{ scale: 0.98 }}
                 onClick={() => setSelectedBatchId(null)}
-                className={`text-left p-4 rounded-2xl border transition-all flex flex-col justify-between min-h-[118px] ${
+                className={`text-left p-4 rounded-2xl border transition-colors flex flex-col justify-between min-h-[122px] ${
                   selectedBatchId === null
                     ? "bg-[var(--brand-blue)] text-white border-[var(--brand-blue)] shadow-md"
                     : "bg-[var(--bg-surface)] text-[var(--text-primary)] border-[var(--border)] hover:border-[var(--brand-blue)]/60 shadow-[var(--shadow-sm)]"
@@ -361,28 +390,32 @@ function DashboardContent() {
                     Complete candidate table
                   </div>
                 </div>
-              </motion.button>
+              </button>
 
-              {/* Clickable Batch Cards (Date in short + Day, Time below) */}
+              {/* Clickable Batch Cards */}
               {batches.map((batch) => {
                 const { dateDay, time } = formatBatchTitle(batch.createdAt);
                 const isSelected = selectedBatchId === batch.id;
+                const isDownloadingThis = downloadingBatchId === batch.id;
+
                 return (
-                  <motion.button
+                  <div
                     key={batch.id}
-                    type="button"
-                    whileHover={{ y: -2 }}
-                    whileTap={{ scale: 0.98 }}
                     onClick={() => setSelectedBatchId(batch.id)}
-                    className={`text-left p-4 rounded-2xl border transition-all flex flex-col justify-between min-h-[118px] ${
+                    role="button"
+                    tabIndex={0}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter" || e.key === " ") setSelectedBatchId(batch.id);
+                    }}
+                    className={`cursor-pointer text-left p-4 rounded-2xl border transition-colors flex flex-col justify-between min-h-[122px] ${
                       isSelected
                         ? "bg-[var(--brand-blue)] text-white border-[var(--brand-blue)] shadow-md"
                         : "bg-[var(--bg-surface)] text-[var(--text-primary)] border-[var(--border)] hover:border-[var(--brand-blue)]/60 shadow-[var(--shadow-sm)]"
                     }`}
                   >
-                    <div className="flex items-center justify-between w-full">
+                    <div className="flex items-center justify-between w-full gap-1">
                       <div
-                        className={`w-8 h-8 rounded-lg flex items-center justify-center ${
+                        className={`w-8 h-8 rounded-lg flex items-center justify-center shrink-0 ${
                           isSelected
                             ? "bg-white/20 text-white"
                             : "bg-indigo-50 text-indigo-600"
@@ -390,15 +423,38 @@ function DashboardContent() {
                       >
                         <Calendar size={15} />
                       </div>
-                      <span
-                        className={`text-[11px] font-bold px-2 py-0.5 rounded-full ${
-                          isSelected
-                            ? "bg-white/20 text-white"
-                            : "bg-[var(--bg-subtle)] text-[var(--text-secondary)]"
-                        }`}
-                      >
-                        {batch.totalJobs} {batch.totalJobs === 1 ? "resume" : "resumes"}
-                      </span>
+
+                      <div className="flex items-center gap-1">
+                        <span
+                          className={`text-[11px] font-bold px-2 py-0.5 rounded-full ${
+                            isSelected
+                              ? "bg-white/20 text-white"
+                              : "bg-[var(--bg-subtle)] text-[var(--text-secondary)]"
+                          }`}
+                        >
+                          {batch.totalJobs} {batch.totalJobs === 1 ? "resume" : "resumes"}
+                        </span>
+                        <button
+                          type="button"
+                          title="Download Batch Summary PDF"
+                          disabled={isDownloadingThis}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            handleDownloadBatchSummary(batch.id);
+                          }}
+                          className={`p-1.5 rounded-lg transition-colors ${
+                            isSelected
+                              ? "hover:bg-white/20 text-white"
+                              : "hover:bg-[var(--bg-subtle)] text-[var(--text-secondary)] hover:text-[var(--brand-blue)]"
+                          }`}
+                        >
+                          {isDownloadingThis ? (
+                            <Loader2 size={14} className="animate-spin" />
+                          ) : (
+                            <FileDown size={14} />
+                          )}
+                        </button>
+                      </div>
                     </div>
 
                     <div className="mt-3">
@@ -422,16 +478,16 @@ function DashboardContent() {
                         </div>
                       )}
                     </div>
-                  </motion.button>
+                  </div>
                 );
               })}
             </div>
           </div>
         )}
 
-        {/* Active Batch Indicator Banner */}
+        {/* Active Batch Indicator Banner + Executive Batch Summary PDF Button */}
         {isOrg && activeBatchObj && (
-          <div className="mb-4 px-4 py-3 rounded-xl bg-[var(--brand-blue-light)] border border-[var(--brand-blue)]/25 flex flex-wrap items-center justify-between gap-2 text-xs">
+          <div className="mb-4 px-4 py-3 rounded-xl bg-[var(--brand-blue-light)] border border-[var(--brand-blue)]/25 flex flex-wrap items-center justify-between gap-3 text-xs">
             <div className="flex items-center gap-2 text-[var(--brand-blue)] font-semibold">
               <Layers size={14} />
               <span>
@@ -443,13 +499,28 @@ function DashboardContent() {
                 ({displayedJobs.length} candidate{displayedJobs.length === 1 ? "" : "s"})
               </span>
             </div>
-            <button
-              type="button"
-              onClick={() => setSelectedBatchId(null)}
-              className="font-bold text-[var(--brand-blue)] hover:underline"
-            >
-              Show All Verifications
-            </button>
+            <div className="flex items-center gap-3">
+              <button
+                type="button"
+                disabled={downloadingBatchId === activeBatchObj.id}
+                onClick={() => handleDownloadBatchSummary(activeBatchObj.id)}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-[var(--brand-blue)] text-white font-semibold hover:bg-blue-700 disabled:opacity-60 transition-colors"
+              >
+                {downloadingBatchId === activeBatchObj.id ? (
+                  <Loader2 size={13} className="animate-spin" />
+                ) : (
+                  <FileDown size={13} />
+                )}
+                <span>Download Batch Summary PDF</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => setSelectedBatchId(null)}
+                className="font-bold text-[var(--brand-blue)] hover:underline"
+              >
+                Show All
+              </button>
+            </div>
           </div>
         )}
 
@@ -486,11 +557,7 @@ function DashboardContent() {
         </div>
 
         {/* Table */}
-        <motion.div
-          initial={{ opacity: 0, y: 10 }}
-          animate={{ opacity: 1, y: 0 }}
-          className="bg-[var(--bg-surface)] border border-[var(--border)] rounded-2xl shadow-[var(--shadow-sm)] overflow-hidden"
-        >
+        <div className="bg-[var(--bg-surface)] border border-[var(--border)] rounded-2xl shadow-[var(--shadow-sm)] overflow-hidden">
           <div className="grid grid-cols-12 gap-4 px-6 py-3 bg-[var(--bg-subtle)] border-b border-[var(--border)] text-xs font-bold text-[var(--text-tertiary)] uppercase tracking-wider">
             <div className="col-span-4">Candidate</div>
             <div className="col-span-2">Status</div>
@@ -499,110 +566,92 @@ function DashboardContent() {
             <div className="col-span-2 text-right">Action</div>
           </div>
 
-          <AnimatePresence mode="popLayout">
-            {loading || loadingBatchJobs ? (
-              <div className="px-6 py-16 text-center text-[var(--text-secondary)]">
-                <motion.div
-                  animate={{ rotate: 360 }}
-                  transition={{ duration: 1.5, repeat: Infinity, ease: "linear" }}
-                  className="w-8 h-8 border-2 border-[var(--brand-blue)] border-t-transparent rounded-full mx-auto mb-3"
-                />
-                Loading verifications from database...
-              </div>
-            ) : filtered.length === 0 ? (
-              <motion.div
-                key="empty"
-                initial={{ opacity: 0 }}
-                animate={{ opacity: 1 }}
-                className="px-6 py-20 text-center"
-              >
-                <BarChart2 className="mx-auto text-[var(--text-tertiary)] mb-4" size={40} />
-                <p className="text-[var(--text-secondary)] font-medium mb-1">
-                  No verifications found
-                </p>
-                <p className="text-sm text-[var(--text-tertiary)] mb-6">
-                  {displayedJobs.length === 0
-                    ? "Submit your first candidate or batch to get started."
-                    : "Try adjusting your search or filter."}
-                </p>
-                {displayedJobs.length === 0 && (
-                  <Link href="/verify">
-                    <button className="px-5 py-2.5 bg-[var(--brand-blue)] text-white rounded-xl text-sm font-semibold hover:bg-blue-700 transition-colors">
-                      Start Verification
-                    </button>
-                  </Link>
-                )}
-              </motion.div>
-            ) : (
-              filtered.map((job, i) => {
-                const name = `${job.candidate?.firstName || "Unknown"} ${
-                  job.candidate?.lastName || ""
-                }`;
-                const email = job.candidate?.email || "N/A";
-                const score = job.report?.trustScore;
-                const date = new Date(job.createdAt).toLocaleDateString("en-IN", {
-                  day: "numeric",
-                  month: "short",
-                  year: "numeric",
-                });
+          {loading || loadingBatchJobs ? (
+            <div className="px-6 py-16 text-center text-[var(--text-secondary)]">
+              <Loader2 className="w-7 h-7 animate-spin text-[var(--brand-blue)] mx-auto mb-3" />
+              Loading verifications from database...
+            </div>
+          ) : filtered.length === 0 ? (
+            <div className="px-6 py-20 text-center">
+              <BarChart2 className="mx-auto text-[var(--text-tertiary)] mb-4" size={40} />
+              <p className="text-[var(--text-secondary)] font-medium mb-1">
+                No verifications found
+              </p>
+              <p className="text-sm text-[var(--text-tertiary)] mb-6">
+                {displayedJobs.length === 0
+                  ? "Submit your first candidate or batch to get started."
+                  : "Try adjusting your search or filter."}
+              </p>
+              {displayedJobs.length === 0 && (
+                <Link href="/verify">
+                  <button className="px-5 py-2.5 bg-[var(--brand-blue)] text-white rounded-xl text-sm font-semibold hover:bg-blue-700 transition-colors">
+                    Start Verification
+                  </button>
+                </Link>
+              )}
+            </div>
+          ) : (
+            filtered.map((job) => {
+              const name = `${job.candidate?.firstName || "Unknown"} ${
+                job.candidate?.lastName || ""
+              }`;
+              const email = job.candidate?.email || "N/A";
+              const score = job.report?.trustScore;
+              const date = new Date(job.createdAt).toLocaleDateString("en-IN", {
+                day: "numeric",
+                month: "short",
+                year: "numeric",
+              });
 
-                return (
-                  <motion.div
-                    key={job.id}
-                    initial={{ opacity: 0, x: -8 }}
-                    animate={{ opacity: 1, x: 0 }}
-                    transition={{ delay: Math.min(i * 0.03, 0.3) }}
-                    className="grid grid-cols-12 gap-4 px-6 py-4 border-b border-[var(--border)] last:border-0 items-center hover:bg-[var(--bg-subtle)] transition-colors group"
-                  >
-                    <div className="col-span-4">
-                      <div className="flex items-center gap-3">
-                        <div className="w-9 h-9 rounded-full bg-gradient-to-br from-blue-400 to-blue-600 flex items-center justify-center text-white text-sm font-bold shrink-0">
-                          {name.charAt(0).toUpperCase()}
-                        </div>
-                        <div className="min-w-0">
-                          <p className="font-semibold text-[var(--text-primary)] text-sm truncate">
-                            {name}
-                          </p>
-                          <p className="text-xs text-[var(--text-secondary)] truncate">{email}</p>
-                        </div>
+              return (
+                <div
+                  key={job.id}
+                  className="grid grid-cols-12 gap-4 px-6 py-4 border-b border-[var(--border)] last:border-0 items-center hover:bg-[var(--bg-subtle)] transition-colors"
+                >
+                  <div className="col-span-4">
+                    <div className="flex items-center gap-3">
+                      <div className="w-9 h-9 rounded-full bg-gradient-to-br from-blue-400 to-blue-600 flex items-center justify-center text-white text-sm font-bold shrink-0">
+                        {name.charAt(0).toUpperCase()}
+                      </div>
+                      <div className="min-w-0">
+                        <p className="font-semibold text-[var(--text-primary)] text-sm truncate">
+                          {name}
+                        </p>
+                        <p className="text-xs text-[var(--text-secondary)] truncate">{email}</p>
                       </div>
                     </div>
-                    <div className="col-span-2">
-                      <StatusBadge status={job.status} />
-                    </div>
-                    <div className="col-span-2">
-                      {score != null ? (
-                        <ScoreRing score={score} />
-                      ) : (
-                        <span className="text-xs text-[var(--text-tertiary)]">—</span>
-                      )}
-                    </div>
-                    <div className="col-span-2">
-                      <span className="text-sm text-[var(--text-secondary)]">{date}</span>
-                    </div>
-                    <div className="col-span-2 flex justify-end">
-                      {job.status === "COMPLETED" ? (
-                        <Link href={`/report/${job.id}`}>
-                          <motion.button
-                            whileHover={{ scale: 1.03 }}
-                            whileTap={{ scale: 0.97 }}
-                            className="flex items-center gap-1.5 px-3 py-1.5 bg-[var(--brand-blue)] text-white rounded-lg text-xs font-semibold hover:bg-blue-700 transition-colors"
-                          >
-                            View Report <ChevronRight size={12} />
-                          </motion.button>
-                        </Link>
-                      ) : (
-                        <span className="text-xs text-[var(--text-tertiary)]">
-                          {job.status === "FAILED" ? "Failed" : "In Progress..."}
-                        </span>
-                      )}
-                    </div>
-                  </motion.div>
-                );
-              })
-            )}
-          </AnimatePresence>
-        </motion.div>
+                  </div>
+                  <div className="col-span-2">
+                    <StatusBadge status={job.status} />
+                  </div>
+                  <div className="col-span-2">
+                    {score != null ? (
+                      <ScoreRing score={score} />
+                    ) : (
+                      <span className="text-xs text-[var(--text-tertiary)]">—</span>
+                    )}
+                  </div>
+                  <div className="col-span-2">
+                    <span className="text-sm text-[var(--text-secondary)]">{date}</span>
+                  </div>
+                  <div className="col-span-2 flex justify-end">
+                    {job.status === "COMPLETED" ? (
+                      <Link href={`/report/${job.id}`}>
+                        <button className="flex items-center gap-1.5 px-3 py-1.5 bg-[var(--brand-blue)] text-white rounded-lg text-xs font-semibold hover:bg-blue-700 transition-colors">
+                          View Report <ChevronRight size={12} />
+                        </button>
+                      </Link>
+                    ) : (
+                      <span className="text-xs text-[var(--text-tertiary)]">
+                        {job.status === "FAILED" ? "Failed" : "In Progress..."}
+                      </span>
+                    )}
+                  </div>
+                </div>
+              );
+            })
+          )}
+        </div>
       </div>
     </div>
   );

@@ -295,12 +295,7 @@ export function Navbar() {
               className="inline-flex items-center gap-1.5 bg-[var(--brand-blue)] text-white text-sm font-semibold px-4 py-2.5 rounded-xl hover:bg-blue-700 transition-colors duration-150"
             >
               <span>New Verification</span>
-              <motion.span
-                animate={{ x: [0, 3, 0] }}
-                transition={{ duration: 1.2, repeat: Infinity, ease: "easeInOut", repeatDelay: 0.8 }}
-              >
-                <ArrowRight size={15} strokeWidth={2.5} />
-              </motion.span>
+              <ArrowRight size={15} strokeWidth={2.5} />
             </Link>
           </motion.div>
         </div>

@@ -437,7 +437,8 @@ export class VerificationOrchestrator {
     candidateId: string, 
     resumeFileUrl?: string,
     certificateAnalyses?: any[],
-    resumeBuffer?: Buffer
+    resumeBuffer?: Buffer,
+    preParsedText?: string
   ): Promise<void> {
     (async () => {
       try {
@@ -466,10 +467,13 @@ export class VerificationOrchestrator {
           createdAt: new Date()
         };
 
-        // --- STEP 1: Parse Resume PDF ---
+        // --- STEP 1: Parse Resume PDF (reuse preParsedText if already extracted during bulk intake) ---
         let rawText = `${candidateRecord.firstName} ${candidateRecord.lastName} - Candidate Profile.`;
         
-        if (resumeBuffer) {
+        if (preParsedText && preParsedText.trim().length > 20) {
+          console.log(`[Orchestrator] STEP 1: Reusing pre-parsed resume text (${preParsedText.length} chars).`);
+          rawText = preParsedText;
+        } else if (resumeBuffer) {
           console.log(`[Orchestrator] STEP 1: Parsing uploaded PDF resume from memory buffer.`);
           const parsedPdf = await parsePdfBuffer(resumeBuffer);
           rawText = parsedPdf.rawText;

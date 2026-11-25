@@ -72,16 +72,11 @@
   --shadow-lg: 0 12px 40px rgba(0,0,0,0.5), 0 4px 12px rgba(0,0,0,0.3);
 }
 
-/* Global transitions for theme switching */
-*, *::before, *::after {
-  transition-property: background-color, border-color, color, fill, stroke, box-shadow;
-  transition-duration: 250ms;
-  transition-timing-function: ease-in-out;
-}
-
+/* Smooth theme switch on body only — avoids wildcard (*) transition jank across thousands of DOM nodes */
 body {
   background-color: var(--bg-page);
   color: var(--text-primary);
+  transition: background-color 180ms ease-out, color 180ms ease-out;
 }
 
 /* Animations */

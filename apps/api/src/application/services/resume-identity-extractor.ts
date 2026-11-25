@@ -2,8 +2,8 @@
  * @file resume-identity-extractor.ts
  * @package apps/api
  * @purpose Automatically extracts candidate name (firstName, lastName), email, institutionalEmail,
- *          and GitHub profile URL from an uploaded resume PDF buffer (scanning both visible text
- *          and embedded PDF hyperlink /URI annotations).
+ *          and GitHub profile URL from an uploaded resume PDF buffer using decompressed PDF
+ *          hyperlink annotations (via pdf-parse/pdfjs) plus raw URI fallback & text parsing.
  */
 
 import crypto from "crypto";
@@ -48,6 +48,32 @@ const RESERVED_GITHUB_PATHS = new Set([
   "readme",
   "solutions",
   "team",
+  // Common resume header labels that must NEVER be mistaken for GitHub handles
+  "linkedin",
+  "leetcode",
+  "codeforces",
+  "hackerrank",
+  "geeksforgeeks",
+  "gfg",
+  "codechef",
+  "kaggle",
+  "portfolio",
+  "website",
+  "email",
+  "phone",
+  "link",
+  "links",
+  "github",
+  "resume",
+  "cv",
+  "profile",
+  "twitter",
+  "medium",
+  "gitlab",
+  "bitbucket",
+  "http",
+  "https",
+  "www",
 ]);
 
 const SKIP_NAME_PATTERNS = [
@@ -78,7 +104,7 @@ function toTitleCase(str: string): string {
     .filter(Boolean)
     .map((word) => {
       if (word.length <= 2 && /^[A-Z.]+$/.test(word)) {
-        return word; // preserve initials like "M", "S", "K."
+        return word;
       }
       return word.charAt(0).toUpperCase() + word.slice(1).toLowerCase();
     })
@@ -97,7 +123,7 @@ function isInstitutionalEmail(email: string): boolean {
   );
 }
 
-function extractUrisFromPdfBuffer(buffer: Buffer): string[] {
+function extractRawUrisFromPdfBuffer(buffer: Buffer): string[] {
   const latin1 = buffer.toString("latin1");
   const uris: string[] = [];
   const uriRegex = /\/URI\s*\(([^)]+)\)/gi;
@@ -110,42 +136,87 @@ function extractUrisFromPdfBuffer(buffer: Buffer): string[] {
   return uris;
 }
 
-function extractGithubUrl(rawText: string, pdfUris: string[]): string | undefined {
-  const combinedSources = [...pdfUris, rawText];
+function isValidGithubUsername(username: string): boolean {
+  const clean = username.trim();
+  if (!clean || clean.length > 39) return false;
+  if (!/^[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,37}[a-zA-Z0-9])?$/.test(clean)) return false;
+  if (RESERVED_GITHUB_PATHS.has(clean.toLowerCase())) return false;
+  return true;
+}
 
-  // 1. Look for full or partial github.com/<username> links
-  const ghRegex =
-    /(?:https?:\/\/)?(?:www\.)?github\.com\/([a-zA-Z0-9](?:[a-zA-Z0-9-]{0,37}[a-zA-Z0-9])?)(?:\/|$|\s|[,;)|\]])/gi;
+function extractGithubUrl(rawText: string, pdfLinks: string[]): string | undefined {
+  // Score every github.com/<username> occurrence:
+  // - Direct profile URLs (https://github.com/user or /user/) get +3 weight
+  // - Project repo URLs (https://github.com/user/repo) get +2 weight
+  // - Text matches get +1 weight
+  const scores = new Map<string, { canonical: string; weight: number }>();
 
-  for (const source of combinedSources) {
-    ghRegex.lastIndex = 0;
-    let match: RegExpExecArray | null;
-    while ((match = ghRegex.exec(source)) !== null) {
-      const candidateUser = match[1]?.trim();
-      if (candidateUser && !RESERVED_GITHUB_PATHS.has(candidateUser.toLowerCase())) {
-        return `https://github.com/${candidateUser}`;
-      }
+  const addCandidate = (rawUser: string, weight: number) => {
+    if (!isValidGithubUsername(rawUser)) return;
+    const key = rawUser.toLowerCase();
+    const existing = scores.get(key);
+    if (existing) {
+      existing.weight += weight;
+    } else {
+      scores.set(key, { canonical: rawUser, weight });
+    }
+  };
+
+  // 1. Inspect decompressed PDF hyperlink annotations + raw /URI strings first (most accurate)
+  const linkGhRegex =
+    /^(?:https?:\/\/)?(?:www\.)?github\.com\/([a-zA-Z0-9-]+)(\/[^?#\s]*)?/i;
+
+  for (const link of pdfLinks) {
+    const trimmed = link.trim();
+    const match = trimmed.match(linkGhRegex);
+    if (match && match[1]) {
+      const hasSubpath = Boolean(match[2] && match[2] !== "/");
+      addCandidate(match[1], hasSubpath ? 2 : 4);
     }
   }
 
-  // 2. Look for "GitHub: username" or "GitHub - @username" in text
-  const labelRegex = /github\s*[:|\-–—]\s*@?([a-zA-Z0-9](?:[a-zA-Z0-9-]{0,37}[a-zA-Z0-9])?)/i;
+  // 2. Inspect visible resume text for explicit github.com/<username> URLs
+  const textGhRegex =
+    /(?:https?:\/\/)?(?:www\.)?github\.com\/([a-zA-Z0-9](?:[a-zA-Z0-9-]{0,37}[a-zA-Z0-9])?)(?:\/|$|\s|[,;)|\]])/gi;
+
+  let textMatch: RegExpExecArray | null;
+  while ((textMatch = textGhRegex.exec(rawText)) !== null) {
+    if (textMatch[1]) {
+      addCandidate(textMatch[1], 2);
+    }
+  }
+
+  if (scores.size > 0) {
+    let best: { canonical: string; weight: number } | null = null;
+    for (const entry of scores.values()) {
+      if (!best || entry.weight > best.weight) {
+        best = entry;
+      }
+    }
+    if (best) {
+      return `https://github.com/${best.canonical}`;
+    }
+  }
+
+  // 3. Safe fallback ONLY for explicit "GitHub: username" or "GitHub - @username"
+  //    (intentionally excludes "|" pipe so "GitHub | LinkedIn" or "GitHub | LeetCode" NEVER matches!)
+  const labelRegex = /\bgithub\s*(?::|—|–|-)\s*@?([a-zA-Z0-9](?:[a-zA-Z0-9-]{0,37}[a-zA-Z0-9])?)\b/i;
   const labelMatch = rawText.match(labelRegex);
-  if (labelMatch?.[1] && !RESERVED_GITHUB_PATHS.has(labelMatch[1].toLowerCase())) {
+  if (labelMatch?.[1] && isValidGithubUsername(labelMatch[1])) {
     return `https://github.com/${labelMatch[1]}`;
   }
 
   return undefined;
 }
 
-function extractEmails(rawText: string, pdfUris: string[]): {
+function extractEmails(rawText: string, pdfLinks: string[]): {
   email?: string;
   institutionalEmail?: string;
 } {
   const found = new Set<string>();
   const emailRegex = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g;
 
-  for (const uri of pdfUris) {
+  for (const uri of pdfLinks) {
     if (uri.toLowerCase().startsWith("mailto:")) {
       const cleaned = uri.replace(/^mailto:/i, "").split("?")[0].trim().toLowerCase();
       if (emailRegex.test(cleaned)) {
@@ -178,13 +249,12 @@ function extractName(rawText: string, fileName: string, fallbackEmail?: string):
 } {
   const lines = rawText
     .split(/\r?\n/)
-    .map((l) => l.replace(/[•|▪●►◆★]/g, " ").replace(/\s+/g, " ").trim())
+    .map((l) => l.replace(/[•|▪●►◆★§ïÐ#]/g, " ").replace(/\s+/g, " ").trim())
     .filter((l) => l.length >= 3 && l.length <= 50);
 
   for (const line of lines.slice(0, 12)) {
     if (SKIP_NAME_PATTERNS.some((re) => re.test(line))) continue;
 
-    // Strip trailing separators or single-letter noise
     const cleaned = line.replace(/[^a-zA-Z.\-\s]/g, "").trim();
     const words = cleaned.split(/\s+/).filter(Boolean);
 
@@ -200,10 +270,9 @@ function extractName(rawText: string, fileName: string, fallbackEmail?: string):
     }
   }
 
-  // Fallback 1: clean filename (e.g. "Abhijay_MS_Resume.pdf")
   const baseName = fileName
     .replace(/\.pdf$/i, "")
-    .replace(/(resume|cv|final|updated|profile|\d+)/gi, " ")
+    .replace(/(resume|cv|final|updated|profile|fidelity|\d+)/gi, " ")
     .replace(/[_\-.]+/g, " ")
     .replace(/\s+/g, " ")
     .trim();
@@ -216,7 +285,6 @@ function extractName(rawText: string, fileName: string, fallbackEmail?: string):
     };
   }
 
-  // Fallback 2: email local-part
   if (fallbackEmail) {
     const local = fallbackEmail.split("@")[0].replace(/[._\-0-9]+/g, " ").trim();
     if (local) {
@@ -236,25 +304,37 @@ export async function extractIdentityFromResume(
   fileName: string = "resume.pdf"
 ): Promise<ExtractedCandidateIdentity> {
   let rawText = "";
+  let decompressedLinks: string[] = [];
+
   try {
     const parsed = await parsePdfBuffer(pdfBuffer);
     rawText = parsed.rawText || "";
+    decompressedLinks = Array.isArray(parsed.links) ? parsed.links : [];
   } catch (err) {
-    console.warn(`[ResumeExtractor] PDF text parse failed for ${fileName}:`, (err as Error).message);
+    console.warn(`[ResumeExtractor] PDF parse failed for ${fileName}:`, (err as Error).message);
   }
 
-  const pdfUris = extractUrisFromPdfBuffer(pdfBuffer);
-  const { email: extractedEmail, institutionalEmail } = extractEmails(rawText, pdfUris);
-  const githubUrl = extractGithubUrl(rawText, pdfUris);
+  const rawBufferLinks = extractRawUrisFromPdfBuffer(pdfBuffer);
+  const allLinks = Array.from(new Set([...decompressedLinks, ...rawBufferLinks]));
+
+  const { email: extractedEmail, institutionalEmail } = extractEmails(rawText, allLinks);
+  const githubUrl = extractGithubUrl(rawText, allLinks);
   const { firstName, lastName } = extractName(rawText, fileName, extractedEmail);
 
-  // Ensure a valid unique email exists even if the PDF was a scanned image without selectable email text
   let finalEmail = extractedEmail;
   if (!finalEmail) {
     const hash = crypto.createHash("sha256").update(pdfBuffer).digest("hex").slice(0, 8);
-    const slug = `${firstName}.${lastName}`.toLowerCase().replace(/[^a-z0-9]+/g, ".").replace(/^\.+|\.+$/g, "") || "candidate";
+    const slug =
+      `${firstName}.${lastName}`
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, ".")
+        .replace(/^\.+|\.+$/g, "") || "candidate";
     finalEmail = `${slug}.${hash}@parsed.verisphere.local`;
   }
+
+  console.log(
+    `[ResumeExtractor] ${fileName} -> ${firstName} ${lastName} | ${finalEmail} | ${githubUrl || "no-github"} (links found: ${allLinks.length})`
+  );
 
   return {
     firstName,
