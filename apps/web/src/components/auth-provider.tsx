@@ -1,10 +1,20 @@
 "use client";
 
 import React, { createContext, useContext, useEffect, useState, useCallback } from "react";
-import type { SessionUser, AccountType } from "@/lib/auth";
+import type { User as SupabaseUser } from "@supabase/supabase-js";
+import {
+  AccountRole,
+  AuthProviderType,
+  SessionUser,
+  resolveAccountRole,
+} from "@/lib/roles";
+import {
+  createSupabaseBrowserClient,
+  isSupabaseConfigured,
+} from "@/lib/supabase/client";
 import type { DemoTransaction } from "@/components/ui/PaymentGatewayModal";
 
-export type PlanId = "starter" | "pro" | "enterprise";
+export type PlanId = "starter" | "pro" | "enterprise" | "admin";
 
 export interface UserBillingState {
   planId: PlanId;
@@ -12,19 +22,17 @@ export interface UserBillingState {
   billingCycle: "monthly" | "annual";
   credits: number | "Unlimited";
   creditsLimit: number | "Unlimited";
-  creditsResetAt: string; // ISO timestamp for 1-month automatic credit reset
+  creditsResetAt: string;
   renewalDate: string;
   transactions: DemoTransaction[];
 }
 
-interface OAuthProviderStatus {
-  google: boolean;
-  github: boolean;
-}
-
 interface AuthContextValue {
   user: SessionUser | null;
-  providers: OAuthProviderStatus;
+  effectiveRole: AccountRole;
+  adminViewAs: AccountRole;
+  setAdminViewAs: (role: AccountRole) => void;
+  supabaseConfigured: boolean;
   loading: boolean;
   billing: UserBillingState;
   refreshSession: () => Promise<void>;
@@ -33,18 +41,18 @@ interface AuthContextValue {
     name?: string;
     role?: string;
     organization?: string;
-    accountType?: AccountType;
   }) => Promise<boolean>;
   consumeCredits: (count?: number) => { allowed: boolean; remaining: number | "Unlimited" };
   recordDemoPurchase: (params: {
     transaction: DemoTransaction;
     itemType: "subscription" | "credits";
-    planId?: PlanId;
+    planId?: "starter" | "pro" | "enterprise";
     planName?: string;
     billingCycle?: "monthly" | "annual";
     creditsIncluded: number | "Unlimited";
   }) => void;
   downgradeToStarter: () => void;
+  resetLocalBillingCache: () => void;
 }
 
 function addOneMonth(from: Date = new Date()): Date {
@@ -61,12 +69,42 @@ function formatDateShort(date: Date): string {
   });
 }
 
-function getStarterAllowance(accountType?: AccountType): number {
-  return accountType === "org" ? 25 : 3;
+function getStarterAllowance(role?: AccountRole): number | "Unlimited" {
+  if (role === "admin") return "Unlimited";
+  if (role === "org") return 25;
+  return 3;
 }
 
-function buildDefaultBilling(accountType?: AccountType): UserBillingState {
-  const starterCredits = getStarterAllowance(accountType);
+function buildAdminBilling(): UserBillingState {
+  return {
+    planId: "admin",
+    planName: "Admin Unlimited",
+    billingCycle: "monthly",
+    credits: "Unlimited",
+    creditsLimit: "Unlimited",
+    creditsResetAt: addOneMonth(new Date()).toISOString(),
+    renewalDate: "No Expiry",
+    transactions: [
+      {
+        id: "txn_vs_ADMIN_GRANT",
+        invoiceNumber: "ADM-UNLIMITED",
+        itemName: "Platform Admin Unrestricted Testing Access",
+        amountFormatted: "$0.00",
+        currency: "USD",
+        methodLabel: "Admin Privilege",
+        status: "PAID",
+        date: formatDateShort(new Date()),
+        creditsAdded: "Unlimited",
+      },
+    ],
+  };
+}
+
+function buildDefaultBilling(role?: AccountRole): UserBillingState {
+  if (role === "admin") {
+    return buildAdminBilling();
+  }
+  const starterCredits = getStarterAllowance(role);
   const resetDate = addOneMonth(new Date());
   return {
     planId: "starter",
@@ -81,7 +119,7 @@ function buildDefaultBilling(accountType?: AccountType): UserBillingState {
         id: "txn_vs_INITIAL01",
         invoiceNumber: "INV-2026-00104",
         itemName:
-          accountType === "org"
+          role === "org"
             ? "Starter Organization Trial Allocation"
             : "Starter Free Plan (3 Monthly Credits)",
         amountFormatted: "$0.00",
@@ -97,8 +135,12 @@ function buildDefaultBilling(accountType?: AccountType): UserBillingState {
 
 function applyMonthlyResetIfDue(
   state: UserBillingState,
-  accountType?: AccountType
+  role?: AccountRole
 ): { state: UserBillingState; changed: boolean } {
+  if (role === "admin") {
+    return { state: buildAdminBilling(), changed: false };
+  }
+
   const now = new Date();
   let changed = false;
   let next = { ...state };
@@ -106,7 +148,7 @@ function applyMonthlyResetIfDue(
   // Migrate legacy 5-credit individual starter states to the strict 3-credit free cap
   if (
     next.planId === "starter" &&
-    accountType !== "org" &&
+    role !== "org" &&
     typeof next.creditsLimit === "number" &&
     next.creditsLimit > 3
   ) {
@@ -117,7 +159,6 @@ function applyMonthlyResetIfDue(
     changed = true;
   }
 
-  // Ensure creditsResetAt is present
   if (!next.creditsResetAt || isNaN(new Date(next.creditsResetAt).getTime())) {
     const resetDate = addOneMonth(now);
     next.creditsResetAt = resetDate.toISOString();
@@ -133,7 +174,7 @@ function applyMonthlyResetIfDue(
         ? "Unlimited"
         : next.planId === "pro"
         ? 100
-        : getStarterAllowance(accountType);
+        : getStarterAllowance(role);
 
     next = {
       ...next,
@@ -148,30 +189,82 @@ function applyMonthlyResetIfDue(
   return { state: next, changed };
 }
 
-function getBillingStorageKey(email?: string, accountType?: AccountType): string {
-  return `verisphere_demo_billing_${(email || "guest").toLowerCase()}_${accountType || "individual"}`;
+function getBillingStorageKey(email?: string, role?: AccountRole): string {
+  return `verisphere_demo_billing_${(email || "guest").toLowerCase()}_${role || "individual"}`;
+}
+
+function mapSupabaseUser(sbUser: SupabaseUser): SessionUser {
+  const email = (sbUser.email || "").trim().toLowerCase();
+  const meta = sbUser.user_metadata || {};
+  const accountType = resolveAccountRole(email, meta.account_type as string | undefined);
+
+  const rawProvider = String(sbUser.app_metadata?.provider || "email").toLowerCase();
+  const provider: AuthProviderType =
+    rawProvider === "google"
+      ? "google"
+      : rawProvider === "github"
+      ? "github"
+      : "email";
+
+  const derivedName =
+    (typeof meta.full_name === "string" && meta.full_name.trim()) ||
+    (typeof meta.name === "string" && meta.name.trim()) ||
+    (typeof meta.user_name === "string" && meta.user_name.trim()) ||
+    (email
+      ? email
+          .split("@")[0]
+          .replace(/[._-]+/g, " ")
+          .replace(/\b\w/g, (c: string) => c.toUpperCase())
+      : "VeriSphere User");
+
+  const defaultRoleTitle =
+    accountType === "admin"
+      ? "Platform Administrator"
+      : accountType === "org"
+      ? "Organization Hiring Lead"
+      : "Individual Candidate";
+
+  const defaultOrg =
+    accountType === "admin"
+      ? "VeriSphere Core Admin"
+      : accountType === "org"
+      ? "Organization Workspace"
+      : "Personal Account";
+
+  return {
+    id: sbUser.id,
+    name: derivedName,
+    email,
+    avatarUrl:
+      (typeof meta.avatar_url === "string" && meta.avatar_url) ||
+      (typeof meta.picture === "string" && meta.picture) ||
+      undefined,
+    provider,
+    accountType,
+    role: (typeof meta.role_title === "string" && meta.role_title.trim()) || defaultRoleTitle,
+    organization:
+      (typeof meta.organization === "string" && meta.organization.trim()) || defaultOrg,
+    signedInAt: sbUser.last_sign_in_at || sbUser.created_at || new Date().toISOString(),
+  };
 }
 
 const AuthContext = createContext<AuthContextValue | null>(null);
 
 export function AuthProvider({ children }: { children: React.ReactNode }) {
+  const supabaseConfigured = isSupabaseConfigured();
   const [user, setUser] = useState<SessionUser | null>(null);
-  const [providers, setProviders] = useState<OAuthProviderStatus>({
-    google: false,
-    github: false,
-  });
+  const [adminViewAs, setAdminViewAs] = useState<AccountRole>("admin");
   const [loading, setLoading] = useState(true);
-  const [billing, setBilling] = useState<UserBillingState>(() => buildDefaultBilling("individual"));
+  const [billing, setBilling] = useState<UserBillingState>(() =>
+    buildDefaultBilling("individual")
+  );
 
   const persistBilling = useCallback(
-    (next: UserBillingState, email?: string, accountType?: AccountType) => {
+    (next: UserBillingState, email?: string, role?: AccountRole) => {
       setBilling(next);
-      if (typeof window === "undefined") return;
+      if (typeof window === "undefined" || role === "admin") return;
       try {
-        localStorage.setItem(
-          getBillingStorageKey(email, accountType),
-          JSON.stringify(next)
-        );
+        localStorage.setItem(getBillingStorageKey(email, role), JSON.stringify(next));
       } catch {
         // ignore storage errors
       }
@@ -180,15 +273,19 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   );
 
   const loadBillingForUser = useCallback(
-    (email?: string, accountType?: AccountType) => {
+    (email?: string, role?: AccountRole) => {
+      if (role === "admin") {
+        setBilling(buildAdminBilling());
+        return;
+      }
       if (typeof window === "undefined") return;
       try {
-        const key = getBillingStorageKey(email, accountType);
+        const key = getBillingStorageKey(email, role);
         const raw = localStorage.getItem(key);
         if (raw) {
           const parsed = JSON.parse(raw) as UserBillingState;
           if (parsed && parsed.planId) {
-            const { state: checked, changed } = applyMonthlyResetIfDue(parsed, accountType);
+            const { state: checked, changed } = applyMonthlyResetIfDue(parsed, role);
             setBilling(checked);
             if (changed) {
               localStorage.setItem(key, JSON.stringify(checked));
@@ -199,86 +296,113 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       } catch {
         // ignore storage errors
       }
-      const fresh = buildDefaultBilling(accountType);
-      persistBilling(fresh, email, accountType);
+      const fresh = buildDefaultBilling(role);
+      persistBilling(fresh, email, role);
     },
     [persistBilling]
   );
 
-  const refreshSession = useCallback(async () => {
-    try {
-      const res = await fetch("/api/auth/session", { cache: "no-store" });
-      if (res.ok) {
-        const data = await res.json();
-        const loadedUser: SessionUser | null = data.user
-          ? {
-              ...data.user,
-              accountType: data.user.accountType === "org" ? "org" : "individual",
-            }
-          : null;
-        setUser(loadedUser);
-        if (data.providers) {
-          setProviders(data.providers);
-        }
-        if (loadedUser) {
-          localStorage.setItem("verisphere_api_key", "demo-api-key-1234");
-        }
-        loadBillingForUser(loadedUser?.email, loadedUser?.accountType);
+  const syncFromSupabaseUser = useCallback(
+    (sbUser: SupabaseUser | null) => {
+      if (!sbUser) {
+        setUser(null);
+        setAdminViewAs("admin");
+        loadBillingForUser(undefined, "individual");
+        return;
       }
-    } catch {
-      // ignore network error
-    } finally {
-      setLoading(false);
-    }
-  }, [loadBillingForUser]);
-
-  useEffect(() => {
-    refreshSession();
-  }, [refreshSession]);
-
-  const logout = useCallback(async () => {
-    await fetch("/api/auth/logout", { method: "POST" });
-    localStorage.removeItem("verisphere_api_key");
-    setUser(null);
-    loadBillingForUser(undefined, "individual");
-  }, [loadBillingForUser]);
-
-  const updateProfile = useCallback(
-    async (fields: {
-      name?: string;
-      role?: string;
-      organization?: string;
-      accountType?: AccountType;
-    }) => {
-      try {
-        const res = await fetch("/api/auth/session", {
-          method: "PATCH",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(fields),
-        });
-        if (!res.ok) return false;
-        const data = await res.json();
-        if (data.user) {
-          const updated: SessionUser = {
-            ...data.user,
-            accountType: data.user.accountType === "org" ? "org" : "individual",
-          };
-          setUser(updated);
-          if (fields.accountType) {
-            loadBillingForUser(updated.email, updated.accountType);
-          }
-          return true;
-        }
-        return false;
-      } catch {
-        return false;
+      const mapped = mapSupabaseUser(sbUser);
+      setUser(mapped);
+      if (mapped.accountType === "admin") {
+        setAdminViewAs("admin");
       }
+      if (typeof window !== "undefined") {
+        localStorage.setItem("verisphere_api_key", "demo-api-key-1234");
+      }
+      loadBillingForUser(mapped.email, mapped.accountType);
     },
     [loadBillingForUser]
   );
 
+  const refreshSession = useCallback(async () => {
+    const supabase = createSupabaseBrowserClient();
+    if (!supabase) {
+      setLoading(false);
+      return;
+    }
+    try {
+      const { data } = await supabase.auth.getUser();
+      syncFromSupabaseUser(data.user || null);
+    } catch {
+      syncFromSupabaseUser(null);
+    } finally {
+      setLoading(false);
+    }
+  }, [syncFromSupabaseUser]);
+
+  useEffect(() => {
+    const supabase = createSupabaseBrowserClient();
+    if (!supabase) {
+      setLoading(false);
+      return;
+    }
+
+    refreshSession();
+
+    const {
+      data: { subscription },
+    } = supabase.auth.onAuthStateChange((_event, session) => {
+      syncFromSupabaseUser(session?.user || null);
+      setLoading(false);
+    });
+
+    return () => {
+      subscription.unsubscribe();
+    };
+  }, [refreshSession, syncFromSupabaseUser]);
+
+  const logout = useCallback(async () => {
+    const supabase = createSupabaseBrowserClient();
+    if (supabase) {
+      await supabase.auth.signOut();
+    }
+    if (typeof window !== "undefined") {
+      localStorage.removeItem("verisphere_api_key");
+    }
+    setUser(null);
+    setAdminViewAs("admin");
+    loadBillingForUser(undefined, "individual");
+  }, [loadBillingForUser]);
+
+  const updateProfile = useCallback(
+    async (fields: { name?: string; role?: string; organization?: string }) => {
+      const supabase = createSupabaseBrowserClient();
+      if (!supabase || !user) return false;
+      try {
+        const { data, error } = await supabase.auth.updateUser({
+          data: {
+            full_name: fields.name?.trim() || user.name,
+            role_title: fields.role?.trim() || user.role,
+            organization: fields.organization?.trim() || user.organization,
+            account_type: user.accountType,
+          },
+        });
+        if (error || !data.user) return false;
+        syncFromSupabaseUser(data.user);
+        return true;
+      } catch {
+        return false;
+      }
+    },
+    [user, syncFromSupabaseUser]
+  );
+
   const consumeCredits = useCallback(
     (count: number = 1): { allowed: boolean; remaining: number | "Unlimited" } => {
+      // Admin accounts have no fixed monthly credits — always unrestricted
+      if (user?.accountType === "admin") {
+        return { allowed: true, remaining: "Unlimited" };
+      }
+
       const { state: checked } = applyMonthlyResetIfDue(billing, user?.accountType);
 
       if (checked.credits === "Unlimited") {
@@ -310,11 +434,20 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     (params: {
       transaction: DemoTransaction;
       itemType: "subscription" | "credits";
-      planId?: PlanId;
+      planId?: "starter" | "pro" | "enterprise";
       planName?: string;
       billingCycle?: "monthly" | "annual";
       creditsIncluded: number | "Unlimited";
     }) => {
+      if (user?.accountType === "admin") {
+        // Record transaction in admin history without capping unlimited credits
+        setBilling((prev) => ({
+          ...prev,
+          transactions: [params.transaction, ...prev.transactions],
+        }));
+        return;
+      }
+
       const nextReset = new Date();
       nextReset.setDate(
         nextReset.getDate() + (params.billingCycle === "annual" ? 365 : 30)
@@ -364,6 +497,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   );
 
   const downgradeToStarter = useCallback(() => {
+    if (user?.accountType === "admin") return;
     const starterCredits = getStarterAllowance(user?.accountType);
     const resetDate = addOneMonth(new Date());
     const nextState: UserBillingState = {
@@ -379,11 +513,27 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     persistBilling(nextState, user?.email, user?.accountType);
   }, [billing, persistBilling, user?.email, user?.accountType]);
 
+  const resetLocalBillingCache = useCallback(() => {
+    if (typeof window === "undefined") return;
+    Object.keys(localStorage).forEach((key) => {
+      if (key.startsWith("verisphere_demo_billing_")) {
+        localStorage.removeItem(key);
+      }
+    });
+    loadBillingForUser(user?.email, user?.accountType);
+  }, [loadBillingForUser, user?.email, user?.accountType]);
+
+  const effectiveRole: AccountRole =
+    user?.accountType === "admin" ? adminViewAs : user?.accountType || "individual";
+
   return (
     <AuthContext.Provider
       value={{
         user,
-        providers,
+        effectiveRole,
+        adminViewAs,
+        setAdminViewAs,
+        supabaseConfigured,
         loading,
         billing,
         refreshSession,
@@ -392,6 +542,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         consumeCredits,
         recordDemoPurchase,
         downgradeToStarter,
+        resetLocalBillingCache,
       }}
     >
       {children}

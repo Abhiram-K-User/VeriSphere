@@ -209,7 +209,9 @@ export function Navbar() {
                     {user.name}
                   </span>
                   <span className="text-[10px] font-bold uppercase tracking-wider text-[var(--brand-blue)]">
-                    {user.accountType === "org" ? "ORG" : "IND"} · {billing.planName}
+                    {user.accountType === "admin"
+                      ? "ADMIN · UNLIMITED"
+                      : `${user.accountType === "org" ? "ORG" : "IND"} · ${billing.planName}`}
                   </span>
                 </div>
                 <ChevronDown size={14} className="text-[var(--text-tertiary)]" />

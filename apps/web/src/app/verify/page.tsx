@@ -44,10 +44,11 @@ interface BulkQueuedJob {
 
 export default function VerifyPage() {
   const router = useRouter();
-  const { user, billing, loading: authLoading, consumeCredits } = useAuth();
+  const { user, effectiveRole, billing, loading: authLoading, consumeCredits } = useAuth();
   const [apiKey, setApiKey] = useState<string | null>(null);
 
-  const isOrg = user?.accountType === "org";
+  const isAdmin = user?.accountType === "admin";
+  const isOrg = effectiveRole === "org" || effectiveRole === "admin";
   const [uploadMode, setUploadMode] = useState<"bulk" | "single">("single");
 
   // Single candidate form state
@@ -95,11 +96,12 @@ export default function VerifyPage() {
     }
   }, [isOrg]);
 
-  // Enforce credit limit immediately on page visit when individual user has 0 credits left
+  // Enforce credit limit immediately on page visit when non-admin user has 0 credits left
   useEffect(() => {
     if (
       !authLoading &&
       user &&
+      !isAdmin &&
       !isProcessing &&
       !activeBatchId &&
       billing.credits !== "Unlimited" &&
@@ -110,7 +112,7 @@ export default function VerifyPage() {
       );
       router.replace("/pricing?reason=limit_reached");
     }
-  }, [authLoading, user, billing.credits, isProcessing, activeBatchId, router]);
+  }, [authLoading, user, isAdmin, billing.credits, isProcessing, activeBatchId, router]);
 
   // Poll bulk batch jobs live
   useEffect(() => {
@@ -423,7 +425,11 @@ export default function VerifyPage() {
             <div>
               <div className="text-xs font-bold text-[var(--text-primary)] flex items-center gap-2">
                 <span>
-                  {isOrg ? "Organization Workspace" : "Individual Free Plan"}
+                  {isAdmin
+                    ? "Platform Admin Workspace"
+                    : isOrg
+                    ? "Organization Workspace"
+                    : "Individual Free Plan"}
                 </span>
                 <span className="px-2 py-0.5 rounded-full text-[10px] font-mono font-bold uppercase bg-[var(--brand-blue-light)] text-[var(--brand-blue)]">
                   {billing.planName}
@@ -431,7 +437,11 @@ export default function VerifyPage() {
               </div>
               <div className="text-xs text-[var(--text-secondary)]">
                 {billing.credits === "Unlimited" ? (
-                  <span>Unlimited verifications available</span>
+                  <span>
+                    {isAdmin
+                      ? "Unlimited admin testing credits · No monthly cap"
+                      : "Unlimited verifications available"}
+                  </span>
                 ) : (
                   <span>
                     <strong className="text-[var(--text-primary)]">

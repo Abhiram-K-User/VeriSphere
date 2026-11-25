@@ -12,25 +12,19 @@ import {
   ShieldCheck,
   AlertCircle,
   Loader2,
-  Sparkles,
-  CheckCircle2,
+  Check,
+  Crown,
 } from "lucide-react";
 import { motion } from "framer-motion";
 import { toast } from "sonner";
 import { useAuth } from "@/components/auth-provider";
-
-const OAUTH_ERROR_MESSAGES: Record<string, string> = {
-  google_not_configured:
-    "Google OAuth is ready in code, but GOOGLE_CLIENT_ID & GOOGLE_CLIENT_SECRET are not set in .env yet.",
-  github_not_configured:
-    "GitHub OAuth is ready in code, but GITHUB_CLIENT_ID & GITHUB_CLIENT_SECRET are not set in .env yet.",
-  invalid_oauth_state:
-    "OAuth CSRF state verification failed or expired. Please try signing in again.",
-  google_token_exchange_failed: "Could not exchange Google authorization code.",
-  github_token_exchange_failed: "Could not exchange GitHub authorization code.",
-  oauth_access_denied: "You cancelled the OAuth sign-in request.",
-  oauth_callback_exception: "An unexpected error occurred during OAuth sign-in.",
-};
+import { createSupabaseBrowserClient } from "@/lib/supabase/client";
+import {
+  ROLE_DEFINITIONS,
+  SelectableRole,
+  resolveAccountRole,
+  isAdminEmail,
+} from "@/lib/roles";
 
 function GoogleIcon() {
   return (
@@ -70,101 +64,185 @@ function GitHubIcon() {
 function LoginFormContent() {
   const router = useRouter();
   const searchParams = useSearchParams();
-  const { user, providers, refreshSession } = useAuth();
+  const { user, supabaseConfigured, refreshSession } = useAuth();
 
-  const [accountType, setAccountType] = useState<"individual" | "org">("individual");
+  const [accountType, setAccountType] = useState<SelectableRole>("individual");
   const [mode, setMode] = useState<"signin" | "signup">("signin");
   const [name, setName] = useState("");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState("");
+  const [infoMessage, setInfoMessage] = useState("");
   const [submitting, setSubmitting] = useState(false);
+  const [oauthLoading, setOauthLoading] = useState<"google" | "github" | null>(null);
 
   const errorParam = searchParams.get("error");
+  const selectedRoleDef = ROLE_DEFINITIONS[accountType];
+  const typedEmailIsAdmin = isAdminEmail(email);
 
   useEffect(() => {
     if (errorParam) {
-      setError(
-        OAUTH_ERROR_MESSAGES[errorParam] ||
-          `Authentication error: ${errorParam}`
-      );
+      setError(decodeURIComponent(errorParam));
     }
   }, [errorParam]);
 
   useEffect(() => {
     if (user) {
-      router.replace("/profile");
+      router.replace(
+        user.accountType === "org" || user.accountType === "admin"
+          ? "/dashboard"
+          : "/profile"
+      );
     }
   }, [user, router]);
 
-  const handleOAuth = (provider: "google" | "github") => {
+  const handleOAuth = async (provider: "google" | "github") => {
     setError("");
-    if (provider === "google" && !providers.google) {
-      setError(OAUTH_ERROR_MESSAGES.google_not_configured);
-      toast.error("Set GOOGLE_CLIENT_ID & GOOGLE_CLIENT_SECRET in .env to enable Google OAuth.");
+    setInfoMessage("");
+    const supabase = createSupabaseBrowserClient();
+    if (!supabase) {
+      setError(
+        "Supabase Auth is not configured yet. Add NEXT_PUBLIC_SUPABASE_URL and NEXT_PUBLIC_SUPABASE_ANON_KEY to apps/web/.env.local."
+      );
       return;
     }
-    if (provider === "github" && !providers.github) {
-      setError(OAUTH_ERROR_MESSAGES.github_not_configured);
-      toast.error("Set GITHUB_CLIENT_ID & GITHUB_CLIENT_SECRET in .env to enable GitHub OAuth.");
-      return;
+
+    setOauthLoading(provider);
+    const redirectTo = `${window.location.origin}/auth/callback?accountType=${accountType}`;
+
+    const { error: oauthErr } = await supabase.auth.signInWithOAuth({
+      provider,
+      options: {
+        redirectTo,
+        queryParams:
+          provider === "google" ? { prompt: "select_account" } : undefined,
+      },
+    });
+
+    if (oauthErr) {
+      setError(oauthErr.message);
+      setOauthLoading(null);
     }
-    window.location.href = `/api/auth/oauth/${provider}?accountType=${accountType}`;
   };
 
-  const handleCredentialsSubmit = async (e: React.FormEvent) => {
+  const handleEmailAuth = async (e: React.FormEvent) => {
     e.preventDefault();
     setError("");
+    setInfoMessage("");
+
+    const supabase = createSupabaseBrowserClient();
+    if (!supabase) {
+      setError(
+        "Supabase Auth is not configured yet. Add NEXT_PUBLIC_SUPABASE_URL and NEXT_PUBLIC_SUPABASE_ANON_KEY to apps/web/.env.local."
+      );
+      return;
+    }
+
     setSubmitting(true);
+    const cleanEmail = email.trim().toLowerCase();
+    const resolvedRole = resolveAccountRole(cleanEmail, accountType);
 
     try {
-      const res = await fetch("/api/auth/login", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ email, password, name, mode, accountType }),
+      if (mode === "signup") {
+        const displayName =
+          name.trim() ||
+          cleanEmail
+            .split("@")[0]
+            .replace(/[._-]+/g, " ")
+            .replace(/\b\w/g, (c: string) => c.toUpperCase());
+
+        const { data, error: signUpErr } = await supabase.auth.signUp({
+          email: cleanEmail,
+          password,
+          options: {
+            emailRedirectTo: `${window.location.origin}/auth/callback?accountType=${accountType}`,
+            data: {
+              full_name: displayName,
+              account_type: resolvedRole,
+              role_title:
+                resolvedRole === "admin"
+                  ? "Platform Administrator"
+                  : resolvedRole === "org"
+                  ? "Organization Hiring Lead"
+                  : "Individual Candidate",
+              organization:
+                resolvedRole === "admin"
+                  ? "VeriSphere Core Admin"
+                  : resolvedRole === "org"
+                  ? "Organization Workspace"
+                  : "Personal Account",
+            },
+          },
+        });
+
+        if (signUpErr) {
+          setError(signUpErr.message);
+          setSubmitting(false);
+          return;
+        }
+
+        if (data.session) {
+          await refreshSession();
+          toast.success(
+            `Account created as ${ROLE_DEFINITIONS[resolvedRole].label}!`
+          );
+          router.push(
+            resolvedRole === "org" || resolvedRole === "admin"
+              ? "/dashboard"
+              : "/profile"
+          );
+        } else {
+          setInfoMessage(
+            "Confirmation link sent! Please check your email inbox to verify your Supabase account, then sign in."
+          );
+          setSubmitting(false);
+        }
+        return;
+      }
+
+      // Sign In with Supabase Auth
+      const { data, error: signInErr } = await supabase.auth.signInWithPassword({
+        email: cleanEmail,
+        password,
       });
 
-      const data = await res.json();
-      if (!res.ok) {
-        setError(data.error || "Sign in failed.");
+      if (signInErr) {
+        setError(signInErr.message);
         setSubmitting(false);
         return;
       }
 
-      await refreshSession();
-      toast.success(
-        mode === "signup"
-          ? `Account created as ${accountType === "org" ? "Organization" : "Individual"}!`
-          : `Welcome back, ${data.user?.name || "User"} (${accountType === "org" ? "Org" : "Individual"})!`
-      );
-      router.push(accountType === "org" ? "/dashboard" : "/profile");
-    } catch {
-      setError("Network error while signing in.");
+      // Sync chosen role into Supabase user_metadata (admin emails are always elevated to "admin")
+      if (data.user) {
+        const finalRole = resolveAccountRole(data.user.email, accountType);
+        if (data.user.user_metadata?.account_type !== finalRole) {
+          await supabase.auth.updateUser({
+            data: { account_type: finalRole },
+          });
+        }
+        await refreshSession();
+        toast.success(`Signed in as ${ROLE_DEFINITIONS[finalRole].label}`);
+        router.push(
+          finalRole === "org" || finalRole === "admin" ? "/dashboard" : "/profile"
+        );
+      }
+    } catch (err: any) {
+      setError(err?.message || "Authentication failed.");
       setSubmitting(false);
     }
   };
 
-  const fillDemoAdmin = () => {
-    setMode("signin");
-    setAccountType("individual");
-    setEmail("admin@verisphere.ai");
-    setPassword("password");
-    setError("");
-    toast.info("Demo admin credentials filled (Individual by default).");
-  };
-
   return (
     <div className="min-h-[calc(100vh-72px)] bg-[var(--bg-page)] flex flex-col items-center justify-center p-6 relative overflow-hidden">
-      {/* Background Decor */}
       <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[620px] h-[620px] bg-[var(--brand-blue)] opacity-5 rounded-full blur-3xl pointer-events-none" />
 
       <motion.div
         initial={{ opacity: 0, y: 18 }}
         animate={{ opacity: 1, y: 0 }}
         transition={{ duration: 0.45, ease: [0.16, 1, 0.3, 1] }}
-        className="w-full max-w-[440px] relative z-10"
+        className="w-full max-w-[480px] relative z-10"
       >
-        <div className="text-center mb-7 flex flex-col items-center">
+        <div className="text-center mb-6 flex flex-col items-center">
           <div className="w-14 h-14 bg-[var(--brand-blue)] rounded-2xl flex items-center justify-center mb-4 shadow-lg shadow-blue-500/20">
             <ShieldCheck className="text-white w-7 h-7" />
           </div>
@@ -172,108 +250,122 @@ function LoginFormContent() {
             {mode === "signin" ? "Sign in to VeriSphere" : "Create your account"}
           </h1>
           <p className="text-sm text-[var(--text-secondary)] mt-1.5">
-            OAuth 2.0 (PKCE) & signed HttpOnly session authentication.
+            Powered by Supabase Auth · Choose your account role to begin.
           </p>
         </div>
 
         <div className="bg-[var(--bg-surface)] p-7 sm:p-8 rounded-3xl border border-[var(--border)] shadow-[var(--shadow-lg)]">
-          {/* Account Type Selector: Individual Candidate vs Organization */}
-          <div className="mb-6">
-            <label className="block text-xs font-semibold uppercase tracking-wider text-[var(--text-tertiary)] mb-2">
-              I am signing in as
+          {!supabaseConfigured && (
+            <div className="mb-5 p-3.5 rounded-xl bg-[var(--warning-bg)] border border-[var(--warning)]/40 text-xs text-[var(--text-primary)]">
+              <strong className="text-[var(--warning)] block mb-1">
+                Supabase Env Vars Required
+              </strong>
+              Add <code className="font-mono">NEXT_PUBLIC_SUPABASE_URL</code> and{" "}
+              <code className="font-mono">NEXT_PUBLIC_SUPABASE_ANON_KEY</code> to{" "}
+              <code className="font-mono">apps/web/.env.local</code> and restart the web server.
+            </div>
+          )}
+
+          {/* STEP 1: Account Role Choice (Clearly Defined) */}
+          <div className="mb-5">
+            <label className="block text-xs font-bold uppercase tracking-wider text-[var(--text-tertiary)] mb-2">
+              1. Select Account Role
             </label>
             <div className="grid grid-cols-2 gap-2.5">
-              <button
-                type="button"
-                onClick={() => setAccountType("individual")}
-                className={`p-3 rounded-xl border text-left transition-all flex items-start gap-2.5 ${
-                  accountType === "individual"
-                    ? "bg-[var(--brand-blue-light)] border-[var(--brand-blue)] ring-1 ring-[var(--brand-blue)]/30"
-                    : "bg-[var(--bg-subtle)] border-[var(--border)] hover:border-[var(--border-strong)]"
-                }`}
-              >
-                <div
-                  className={`w-8 h-8 rounded-lg flex items-center justify-center shrink-0 ${
-                    accountType === "individual"
-                      ? "bg-[var(--brand-blue)] text-white"
-                      : "bg-[var(--bg-surface)] text-[var(--text-secondary)] border border-[var(--border)]"
-                  }`}
-                >
-                  <User size={16} />
-                </div>
-                <div className="min-w-0">
-                  <div className="text-xs font-bold text-[var(--text-primary)] leading-tight">
-                    Individual
-                  </div>
-                  <div className="text-[10px] text-[var(--text-tertiary)] mt-0.5 leading-snug">
-                    3 free verifications / mo
-                  </div>
-                </div>
-              </button>
+              {(["individual", "org"] as const).map((roleKey) => {
+                const def = ROLE_DEFINITIONS[roleKey];
+                const selected = accountType === roleKey;
+                const Icon = roleKey === "org" ? Building2 : User;
+                return (
+                  <button
+                    key={roleKey}
+                    type="button"
+                    onClick={() => setAccountType(roleKey)}
+                    className={`p-3.5 rounded-xl border text-left transition-all flex items-start gap-2.5 ${
+                      selected
+                        ? "bg-[var(--brand-blue-light)] border-[var(--brand-blue)] ring-1 ring-[var(--brand-blue)]/30"
+                        : "bg-[var(--bg-subtle)] border-[var(--border)] hover:border-[var(--border-strong)]"
+                    }`}
+                  >
+                    <div
+                      className={`w-8 h-8 rounded-lg flex items-center justify-center shrink-0 ${
+                        selected
+                          ? "bg-[var(--brand-blue)] text-white"
+                          : "bg-[var(--bg-surface)] text-[var(--text-secondary)] border border-[var(--border)]"
+                      }`}
+                    >
+                      <Icon size={16} />
+                    </div>
+                    <div className="min-w-0">
+                      <div className="text-xs font-bold text-[var(--text-primary)] leading-tight">
+                        {roleKey === "org" ? "Organization" : "Individual"}
+                      </div>
+                      <div className="text-[10px] text-[var(--text-tertiary)] mt-0.5 leading-snug">
+                        {roleKey === "org"
+                          ? "Bulk upload & batches"
+                          : "3 free credits / month"}
+                      </div>
+                    </div>
+                  </button>
+                );
+              })}
+            </div>
 
-              <button
-                type="button"
-                onClick={() => setAccountType("org")}
-                className={`p-3 rounded-xl border text-left transition-all flex items-start gap-2.5 ${
-                  accountType === "org"
-                    ? "bg-[var(--brand-blue-light)] border-[var(--brand-blue)] ring-1 ring-[var(--brand-blue)]/30"
-                    : "bg-[var(--bg-subtle)] border-[var(--border)] hover:border-[var(--border-strong)]"
-                }`}
-              >
-                <div
-                  className={`w-8 h-8 rounded-lg flex items-center justify-center shrink-0 ${
-                    accountType === "org"
-                      ? "bg-[var(--brand-blue)] text-white"
-                      : "bg-[var(--bg-surface)] text-[var(--text-secondary)] border border-[var(--border)]"
-                  }`}
-                >
-                  <Building2 size={16} />
-                </div>
-                <div className="min-w-0">
-                  <div className="text-xs font-bold text-[var(--text-primary)] leading-tight">
-                    Organization
-                  </div>
-                  <div className="text-[10px] text-[var(--text-tertiary)] mt-0.5 leading-snug">
-                    Bulk upload &amp; batches
-                  </div>
-                </div>
-              </button>
+            {/* Clear Role Capabilities Preview */}
+            <div className="mt-2.5 p-3 rounded-xl bg-[var(--bg-subtle)] border border-[var(--border)]">
+              <div className="text-[11px] font-bold text-[var(--text-primary)] mb-1">
+                {selectedRoleDef.label} Permissions:
+              </div>
+              <ul className="space-y-1">
+                {selectedRoleDef.capabilities.slice(0, 3).map((cap) => (
+                  <li
+                    key={cap}
+                    className="flex items-start gap-1.5 text-[11px] text-[var(--text-secondary)]"
+                  >
+                    <Check size={12} className="text-[var(--verified)] shrink-0 mt-0.5" />
+                    <span>{cap}</span>
+                  </li>
+                ))}
+              </ul>
             </div>
           </div>
 
-          {/* OAuth 2.0 Providers */}
-          <div className="space-y-3">
+          {/* STEP 2: OAuth via Supabase */}
+          <div className="space-y-2.5">
+            <label className="block text-xs font-bold uppercase tracking-wider text-[var(--text-tertiary)]">
+              2. Authenticate via Supabase
+            </label>
             <button
               type="button"
+              disabled={oauthLoading !== null}
               onClick={() => handleOAuth("google")}
-              className="w-full py-3 px-4 rounded-xl border border-[var(--border-strong)] bg-[var(--bg-surface)] hover:bg-[var(--bg-subtle)] text-sm font-semibold text-[var(--text-primary)] flex items-center justify-center gap-3 transition-colors"
+              className="w-full py-3 px-4 rounded-xl border border-[var(--border-strong)] bg-[var(--bg-surface)] hover:bg-[var(--bg-subtle)] disabled:opacity-60 text-sm font-semibold text-[var(--text-primary)] flex items-center justify-center gap-3 transition-colors"
             >
-              <GoogleIcon />
-              <span>Continue with Google</span>
-              {providers.google && (
-                <span className="ml-auto text-[10px] font-mono px-1.5 py-0.5 rounded bg-[var(--verified-bg)] text-[var(--verified)]">
-                  LIVE
-                </span>
+              {oauthLoading === "google" ? (
+                <Loader2 size={18} className="animate-spin text-[var(--brand-blue)]" />
+              ) : (
+                <GoogleIcon />
               )}
+              <span>Continue with Google</span>
             </button>
 
             <button
               type="button"
+              disabled={oauthLoading !== null}
               onClick={() => handleOAuth("github")}
-              className="w-full py-3 px-4 rounded-xl border border-[var(--border-strong)] bg-[var(--bg-surface)] hover:bg-[var(--bg-subtle)] text-sm font-semibold text-[var(--text-primary)] flex items-center justify-center gap-3 transition-colors"
+              className="w-full py-3 px-4 rounded-xl border border-[var(--border-strong)] bg-[var(--bg-surface)] hover:bg-[var(--bg-subtle)] disabled:opacity-60 text-sm font-semibold text-[var(--text-primary)] flex items-center justify-center gap-3 transition-colors"
             >
-              <GitHubIcon />
-              <span>Continue with GitHub</span>
-              {providers.github && (
-                <span className="ml-auto text-[10px] font-mono px-1.5 py-0.5 rounded bg-[var(--verified-bg)] text-[var(--verified)]">
-                  LIVE
-                </span>
+              {oauthLoading === "github" ? (
+                <Loader2 size={18} className="animate-spin text-[var(--brand-blue)]" />
+              ) : (
+                <GitHubIcon />
               )}
+              <span>Continue with GitHub</span>
             </button>
           </div>
 
           {/* Divider */}
-          <div className="relative my-6 flex items-center">
+          <div className="relative my-5 flex items-center">
             <div className="flex-grow border-t border-[var(--border)]" />
             <span className="px-3 text-xs font-medium text-[var(--text-tertiary)] uppercase tracking-wider">
               or with email
@@ -281,13 +373,14 @@ function LoginFormContent() {
             <div className="flex-grow border-t border-[var(--border)]" />
           </div>
 
-          {/* Mode Tabs */}
-          <div className="grid grid-cols-2 gap-1 p-1 rounded-xl bg-[var(--bg-subtle)] border border-[var(--border)] mb-5">
+          {/* Sign In / Sign Up Switch */}
+          <div className="grid grid-cols-2 gap-1 p-1 rounded-xl bg-[var(--bg-subtle)] border border-[var(--border)] mb-4">
             <button
               type="button"
               onClick={() => {
                 setMode("signin");
                 setError("");
+                setInfoMessage("");
               }}
               className={`py-2 text-xs font-semibold rounded-lg transition-all ${
                 mode === "signin"
@@ -302,6 +395,7 @@ function LoginFormContent() {
               onClick={() => {
                 setMode("signup");
                 setError("");
+                setInfoMessage("");
               }}
               className={`py-2 text-xs font-semibold rounded-lg transition-all ${
                 mode === "signup"
@@ -313,6 +407,16 @@ function LoginFormContent() {
             </button>
           </div>
 
+          {typedEmailIsAdmin && (
+            <div className="mb-4 p-3 rounded-xl bg-purple-500/10 border border-purple-500/30 flex items-center gap-2 text-xs text-purple-600 dark:text-purple-400">
+              <Crown size={15} className="shrink-0" />
+              <span>
+                Admin email detected — this account will sign in with{" "}
+                <strong>Admin (Unlimited Credits &amp; Controls)</strong>.
+              </span>
+            </div>
+          )}
+
           {error && (
             <div className="mb-4 p-3 rounded-xl bg-[var(--danger-bg)] border border-[var(--danger)]/30 flex items-start gap-2.5 text-xs text-[var(--danger)]">
               <AlertCircle size={16} className="shrink-0 mt-0.5" />
@@ -320,10 +424,16 @@ function LoginFormContent() {
             </div>
           )}
 
-          <form onSubmit={handleCredentialsSubmit} className="space-y-4">
+          {infoMessage && (
+            <div className="mb-4 p-3 rounded-xl bg-[var(--verified-bg)] border border-[var(--verified)]/30 text-xs text-[var(--verified)]">
+              {infoMessage}
+            </div>
+          )}
+
+          <form onSubmit={handleEmailAuth} className="space-y-3.5">
             {mode === "signup" && (
               <div>
-                <label className="block text-xs font-medium text-[var(--text-secondary)] mb-1.5">
+                <label className="block text-xs font-medium text-[var(--text-secondary)] mb-1">
                   Full Name
                 </label>
                 <div className="relative flex items-center">
@@ -341,7 +451,7 @@ function LoginFormContent() {
             )}
 
             <div>
-              <label className="block text-xs font-medium text-[var(--text-secondary)] mb-1.5">
+              <label className="block text-xs font-medium text-[var(--text-secondary)] mb-1">
                 Email Address
               </label>
               <div className="relative flex items-center">
@@ -350,7 +460,7 @@ function LoginFormContent() {
                   type="email"
                   value={email}
                   onChange={(e) => setEmail(e.target.value)}
-                  placeholder="admin@verisphere.ai"
+                  placeholder="you@example.com"
                   required
                   className="w-full bg-[var(--bg-subtle)] border border-[var(--border)] focus:border-[var(--brand-blue)] rounded-xl py-2.5 pl-10 pr-4 text-sm text-[var(--text-primary)] outline-none"
                 />
@@ -358,7 +468,7 @@ function LoginFormContent() {
             </div>
 
             <div>
-              <label className="block text-xs font-medium text-[var(--text-secondary)] mb-1.5">
+              <label className="block text-xs font-medium text-[var(--text-secondary)] mb-1">
                 Password
               </label>
               <div className="relative flex items-center">
@@ -383,36 +493,24 @@ function LoginFormContent() {
               {submitting ? (
                 <>
                   <Loader2 size={16} className="animate-spin" />
-                  <span>Authenticating...</span>
+                  <span>Authenticating via Supabase...</span>
                 </>
               ) : (
                 <>
-                  <span>{mode === "signin" ? "Sign In" : "Create Demo Account"}</span>
+                  <span>
+                    {mode === "signin"
+                      ? `Sign In as ${typedEmailIsAdmin ? "Admin" : selectedRoleDef.label}`
+                      : `Create ${selectedRoleDef.label} Account`}
+                  </span>
                   <ArrowRight className="w-4 h-4" />
                 </>
               )}
             </button>
           </form>
-
-          {/* Quick Demo Helper */}
-          <div className="mt-5 pt-4 border-t border-[var(--border)] flex items-center justify-between gap-2">
-            <span className="text-[11px] text-[var(--text-tertiary)] flex items-center gap-1">
-              <CheckCircle2 size={12} className="text-[var(--verified)]" />
-              Demo credentials ready
-            </span>
-            <button
-              type="button"
-              onClick={fillDemoAdmin}
-              className="inline-flex items-center gap-1 text-xs font-semibold text-[var(--brand-blue)] hover:underline"
-            >
-              <Sparkles size={12} />
-              Fill Demo Admin
-            </button>
-          </div>
         </div>
 
         <p className="mt-5 text-center text-xs text-[var(--text-tertiary)]">
-          Protected with OAuth 2.0 PKCE (S256), CSRF state verification, and HMAC-SHA256 HttpOnly cookies.{" "}
+          Secured by Supabase Auth (PKCE + SSR HTTP-only session cookies).{" "}
           <Link href="/pricing" className="text-[var(--brand-blue)] hover:underline">
             View Plans
           </Link>

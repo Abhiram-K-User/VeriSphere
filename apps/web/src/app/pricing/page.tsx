@@ -22,7 +22,7 @@ import {
   Currency,
   DemoTransaction,
 } from "@/components/ui/PaymentGatewayModal";
-import { useAuth, PlanId } from "@/components/auth-provider";
+import { useAuth } from "@/components/auth-provider";
 
 interface PlanDefinition {
   id: string;
@@ -186,7 +186,7 @@ function PricingPageContent() {
 
   const handlePaymentSuccess = (tx: DemoTransaction) => {
     if (!selectedItem) return;
-    const basePlanId = selectedItem.id.split("-")[0] as PlanId;
+    const basePlanId = selectedItem.id.split("-")[0] as "starter" | "pro" | "enterprise";
     const planObj = PLANS.find((p) => p.id === basePlanId);
 
     recordDemoPurchase({
@@ -199,7 +199,7 @@ function PricingPageContent() {
     });
   };
 
-  const activePlanObj = PLANS.find((p) => p.id === activePlanId) || PLANS[0];
+  const activePlanLabel = billing.planName || (PLANS.find((p) => p.id === activePlanId) || PLANS[0]).name;
 
   return (
     <main className="min-h-screen bg-[var(--bg-page)] pb-24">
@@ -317,7 +317,7 @@ function PricingPageContent() {
                 </span>
               </div>
               <h2 className="font-heading font-bold text-xl text-[var(--text-primary)] mt-0.5">
-                VeriSphere {activePlanObj.name}
+                VeriSphere {activePlanLabel}
               </h2>
             </div>
           </div>

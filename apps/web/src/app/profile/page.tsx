@@ -22,9 +22,15 @@ import {
   Loader2,
   CheckCircle2,
   KeyRound,
+  Crown,
+  Wrench,
+  Layers,
+  RefreshCw,
+  Activity,
 } from "lucide-react";
 import { toast } from "sonner";
 import { useAuth } from "@/components/auth-provider";
+import { getRoleDefinition, AccountRole } from "@/lib/roles";
 import type { DemoTransaction } from "@/components/ui/PaymentGatewayModal";
 
 const PLAN_FEATURES: Record<string, string[]> = {
@@ -51,6 +57,13 @@ const PLAN_FEATURES: Record<string, string[]> = {
     "Custom university & issuer registries",
     "24/7 dedicated forensic engineering support",
   ],
+  admin: [
+    "Unlimited verifications (no monthly credit cap)",
+    "Full access to Bulk Organization Resume Upload",
+    "Full access to Organization Batch Dashboard",
+    "Role View Simulator (preview Individual / Org / Admin)",
+    "Live Supabase Auth session & API health diagnostics",
+  ],
 };
 
 function ProfileContent() {
@@ -58,15 +71,18 @@ function ProfileContent() {
   const searchParams = useSearchParams();
   const {
     user,
-    providers,
+    effectiveRole,
+    adminViewAs,
+    setAdminViewAs,
     loading,
     billing,
     logout,
     updateProfile,
     downgradeToStarter,
+    resetLocalBillingCache,
   } = useAuth();
 
-  const [activeTab, setActiveTab] = useState<"plan" | "billing" | "security">("plan");
+  const [activeTab, setActiveTab] = useState<"plan" | "billing" | "security" | "admin">("plan");
 
   // Editable profile fields
   const [editName, setEditName] = useState("");
@@ -74,12 +90,16 @@ function ProfileContent() {
   const [editOrg, setEditOrg] = useState("");
   const [savingProfile, setSavingProfile] = useState(false);
 
+  // Admin health check state
+  const [apiHealth, setApiHealth] = useState<string | null>(null);
+  const [checkingHealth, setCheckingHealth] = useState(false);
+
   useEffect(() => {
     const welcome = searchParams.get("welcome");
     if (welcome === "google") {
-      toast.success("Signed in securely with Google OAuth 2.0!");
+      toast.success("Signed in securely with Google via Supabase Auth!");
     } else if (welcome === "github") {
-      toast.success("Signed in securely with GitHub OAuth 2.0!");
+      toast.success("Signed in securely with GitHub via Supabase Auth!");
     }
   }, [searchParams]);
 
@@ -101,7 +121,7 @@ function ProfileContent() {
     });
     setSavingProfile(false);
     if (ok) {
-      toast.success("Profile updated in signed session.");
+      toast.success("Profile updated in Supabase Auth metadata.");
     } else {
       toast.error("Failed to update profile.");
     }
@@ -111,6 +131,21 @@ function ProfileContent() {
     await logout();
     toast.success("Signed out safely.");
     router.push("/login");
+  };
+
+  const handleCheckApiHealth = async () => {
+    setCheckingHealth(true);
+    try {
+      const res = await fetch("http://localhost:4000/health");
+      const data = await res.json();
+      setApiHealth(`${data.status?.toUpperCase() || "OK"} (${new Date(data.timestamp).toLocaleTimeString()})`);
+      toast.success("Backend API is healthy.");
+    } catch {
+      setApiHealth("UNREACHABLE (Port 4000)");
+      toast.error("Backend API could not be reached.");
+    } finally {
+      setCheckingHealth(false);
+    }
   };
 
   const handleDownloadReceipt = (tx: DemoTransaction) => {
@@ -163,14 +198,14 @@ function ProfileContent() {
             Sign in to view your Profile
           </h1>
           <p className="text-sm text-[var(--text-secondary)] mt-2 mb-6">
-            Access your active VeriSphere plan, forensic verification credits, billing receipts, and OAuth security settings.
+            Access your VeriSphere role, active plan, forensic verification credits, billing receipts, and Supabase Auth settings.
           </p>
           <div className="flex flex-col gap-3">
             <Link
               href="/login"
               className="w-full py-3 px-4 rounded-xl bg-[var(--brand-blue)] text-white font-heading font-semibold text-sm flex items-center justify-center gap-2 hover:opacity-95 transition-opacity"
             >
-              <span>Sign In / OAuth Login</span>
+              <span>Sign In with Supabase Auth</span>
               <ArrowRight size={16} />
             </Link>
             <Link
@@ -184,6 +219,9 @@ function ProfileContent() {
       </main>
     );
   }
+
+  const isAdmin = user.accountType === "admin";
+  const roleDef = getRoleDefinition(user.accountType);
 
   const initials = user.name
     .split(" ")
@@ -204,10 +242,10 @@ function ProfileContent() {
 
   const providerLabel =
     user.provider === "google"
-      ? "Google OAuth 2.0"
+      ? "Google (Supabase OAuth)"
       : user.provider === "github"
-      ? "GitHub OAuth 2.0"
-      : "Email & Password";
+      ? "GitHub (Supabase OAuth)"
+      : "Email & Password (Supabase Auth)";
 
   return (
     <main className="min-h-[calc(100vh-72px)] bg-[var(--bg-page)] pb-20">
@@ -223,7 +261,13 @@ function ProfileContent() {
                 className="w-16 h-16 sm:w-20 sm:h-20 rounded-2xl object-cover border-2 border-[var(--brand-blue)]/30 shadow-md shrink-0"
               />
             ) : (
-              <div className="w-16 h-16 sm:w-20 sm:h-20 rounded-2xl bg-gradient-to-br from-[#1B3A6B] to-[#2563EB] text-white font-heading font-bold text-2xl flex items-center justify-center shadow-md shrink-0">
+              <div
+                className={`w-16 h-16 sm:w-20 sm:h-20 rounded-2xl text-white font-heading font-bold text-2xl flex items-center justify-center shadow-md shrink-0 ${
+                  isAdmin
+                    ? "bg-gradient-to-br from-purple-600 to-indigo-700"
+                    : "bg-gradient-to-br from-[#1B3A6B] to-[#2563EB]"
+                }`}
+              >
                 {initials}
               </div>
             )}
@@ -233,11 +277,20 @@ function ProfileContent() {
                 <h1 className="font-heading font-bold text-2xl sm:text-3xl text-[var(--text-primary)] tracking-tight">
                   {user.name}
                 </h1>
-                <span className="px-2.5 py-0.5 rounded-full text-[11px] font-bold uppercase tracking-wider bg-[var(--bg-subtle)] text-[var(--text-secondary)] border border-[var(--border-strong)]">
-                  {user.accountType === "org" ? "Organization" : "Individual"}
+                <span
+                  className={`inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[11px] font-bold uppercase tracking-wider border ${
+                    isAdmin
+                      ? "bg-purple-500/15 text-purple-600 dark:text-purple-400 border-purple-500/30"
+                      : user.accountType === "org"
+                      ? "bg-indigo-500/15 text-indigo-600 dark:text-indigo-400 border-indigo-500/30"
+                      : "bg-[var(--bg-subtle)] text-[var(--text-secondary)] border-[var(--border-strong)]"
+                  }`}
+                >
+                  {isAdmin && <Crown size={11} />}
+                  {roleDef.shortBadge}
                 </span>
                 <span className="px-2.5 py-0.5 rounded-full text-[11px] font-bold uppercase tracking-wider bg-[var(--brand-blue-light)] text-[var(--brand-blue)] border border-[var(--brand-blue)]/25">
-                  {billing.planName} Plan
+                  {billing.planName}
                 </span>
               </div>
 
@@ -248,20 +301,22 @@ function ProfileContent() {
               <div className="mt-2 flex flex-wrap items-center gap-3 text-xs text-[var(--text-tertiary)]">
                 <span className="inline-flex items-center gap-1 text-[var(--verified)] font-medium">
                   <ShieldCheck size={14} />
-                  Authenticated via {providerLabel}
+                  {providerLabel}
                 </span>
               </div>
             </div>
           </div>
 
           <div className="flex items-center gap-3">
-            <Link
-              href="/pricing"
-              className="px-4 py-2.5 rounded-xl bg-[var(--brand-blue)] text-white text-xs sm:text-sm font-semibold flex items-center gap-2 hover:opacity-95 shadow-sm transition-opacity"
-            >
-              <Sparkles size={15} />
-              <span>Upgrade / Buy Credits</span>
-            </Link>
+            {!isAdmin && (
+              <Link
+                href="/pricing"
+                className="px-4 py-2.5 rounded-xl bg-[var(--brand-blue)] text-white text-xs sm:text-sm font-semibold flex items-center gap-2 hover:opacity-95 shadow-sm transition-opacity"
+              >
+                <Sparkles size={15} />
+                <span>Upgrade / Buy Credits</span>
+              </Link>
+            )}
             <button
               onClick={handleLogout}
               className="px-4 py-2.5 rounded-xl bg-[var(--bg-subtle)] border border-[var(--border-strong)] text-xs sm:text-sm font-semibold text-[var(--text-secondary)] hover:text-[var(--danger)] hover:border-[var(--danger)]/40 flex items-center gap-2 transition-colors"
@@ -278,14 +333,20 @@ function ProfileContent() {
         <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-8">
           <div className="p-5 rounded-2xl bg-[var(--bg-surface)] border border-[var(--border)] shadow-sm">
             <div className="flex items-center justify-between text-[var(--text-tertiary)] mb-2">
-              <span className="text-xs font-medium uppercase tracking-wider">Current Plan</span>
-              <Sparkles size={16} className="text-[var(--brand-blue)]" />
+              <span className="text-xs font-medium uppercase tracking-wider">Account Role</span>
+              {isAdmin ? (
+                <Crown size={16} className="text-purple-500" />
+              ) : (
+                <Sparkles size={16} className="text-[var(--brand-blue)]" />
+              )}
             </div>
             <div className="font-heading font-bold text-xl text-[var(--text-primary)]">
-              {billing.planName}
+              {roleDef.label}
             </div>
-            <div className="text-xs text-[var(--text-tertiary)] mt-1 capitalize">
-              {billing.billingCycle} billing
+            <div className="text-xs text-[var(--text-tertiary)] mt-1">
+              {isAdmin && effectiveRole !== "admin"
+                ? `Simulating: ${effectiveRole.toUpperCase()}`
+                : billing.planName}
             </div>
           </div>
 
@@ -298,20 +359,20 @@ function ProfileContent() {
               {billing.credits === "Unlimited" ? "∞ Unlimited" : billing.credits}
             </div>
             <div className="text-xs text-[var(--text-tertiary)] mt-1">
-              Ready for verifications
+              {isAdmin ? "No monthly cap" : `Resets ${billing.renewalDate}`}
             </div>
           </div>
 
           <div className="p-5 rounded-2xl bg-[var(--bg-surface)] border border-[var(--border)] shadow-sm">
             <div className="flex items-center justify-between text-[var(--text-tertiary)] mb-2">
-              <span className="text-xs font-medium uppercase tracking-wider">Next Renewal</span>
+              <span className="text-xs font-medium uppercase tracking-wider">Reset / Renewal</span>
               <Calendar size={16} className="text-[var(--text-secondary)]" />
             </div>
             <div className="font-heading font-bold text-xl text-[var(--text-primary)]">
               {billing.renewalDate}
             </div>
             <div className="text-xs text-[var(--text-tertiary)] mt-1">
-              Sandbox demo cycle
+              {isAdmin ? "Unrestricted admin tier" : "Automatic 1-month cycle"}
             </div>
           </div>
 
@@ -324,7 +385,7 @@ function ProfileContent() {
               {billing.transactions.length}
             </div>
             <div className="text-xs text-[var(--verified)] mt-1 font-medium">
-              All paid & current
+              All paid &amp; current
             </div>
           </div>
         </div>
@@ -332,9 +393,12 @@ function ProfileContent() {
         {/* Navigation Tabs */}
         <div className="flex flex-wrap gap-2 border-b border-[var(--border)] mb-7">
           {[
-            { id: "plan" as const, label: "Plan & Usage", icon: CreditCard },
+            { id: "plan" as const, label: "Role, Plan & Usage", icon: CreditCard },
             { id: "billing" as const, label: "Billing & Invoices", icon: Receipt },
-            { id: "security" as const, label: "Account & OAuth Security", icon: Settings },
+            { id: "security" as const, label: "Account & Supabase Auth", icon: Settings },
+            ...(isAdmin
+              ? [{ id: "admin" as const, label: "Admin Controls", icon: Wrench }]
+              : []),
           ].map((tab) => {
             const Icon = tab.icon;
             const active = activeTab === tab.id;
@@ -362,15 +426,13 @@ function ProfileContent() {
               <div className="flex items-start justify-between gap-4 pb-5 border-b border-[var(--border)]">
                 <div>
                   <span className="text-[11px] font-bold uppercase tracking-wider text-[var(--brand-blue)]">
-                    Subscription Details
+                    {roleDef.label} · Subscription Details
                   </span>
                   <h2 className="font-heading font-bold text-2xl text-[var(--text-primary)] mt-1">
                     VeriSphere {billing.planName}
                   </h2>
                   <p className="text-xs text-[var(--text-secondary)] mt-1">
-                    {billing.planId === "starter"
-                      ? "Free workspace tier · Upgrade anytime for deep PDF forensics & unlimited scale."
-                      : `Active ${billing.billingCycle} subscription · Renews on ${billing.renewalDate}`}
+                    {roleDef.tagline}
                   </p>
                 </div>
                 <span className="px-3 py-1 rounded-full text-xs font-bold bg-[var(--verified-bg)] text-[var(--verified)]">
@@ -386,7 +448,7 @@ function ProfileContent() {
                   </span>
                   <span className="font-mono font-bold text-[var(--text-primary)]">
                     {billing.credits === "Unlimited"
-                      ? "Unlimited Available"
+                      ? "∞ Unlimited (No Monthly Cap)"
                       : `${billing.credits} / ${billing.creditsLimit} available`}
                   </span>
                 </div>
@@ -401,7 +463,7 @@ function ProfileContent() {
               {/* Plan Features */}
               <div>
                 <h3 className="text-xs font-semibold uppercase tracking-wider text-[var(--text-tertiary)] mb-3">
-                  Included in Your Plan
+                  Included Capabilities
                 </h3>
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
                   {features.map((feat) => (
@@ -417,49 +479,56 @@ function ProfileContent() {
               </div>
 
               {/* Actions */}
-              <div className="mt-7 pt-5 border-t border-[var(--border)] flex flex-wrap items-center gap-3">
-                <Link
-                  href="/pricing"
-                  className="px-4 py-2.5 rounded-xl bg-[var(--brand-blue)] text-white text-xs font-semibold inline-flex items-center gap-1.5 hover:opacity-95"
-                >
-                  <span>Change Plan</span>
-                  <ArrowRight size={14} />
-                </Link>
-                <Link
-                  href="/pricing"
-                  className="px-4 py-2.5 rounded-xl bg-[var(--bg-subtle)] border border-[var(--border-strong)] text-[var(--text-primary)] text-xs font-semibold hover:bg-[var(--bg-muted)]"
-                >
-                  Buy Extra Credits
-                </Link>
-                {billing.planId !== "starter" && (
-                  <button
-                    type="button"
-                    onClick={() => {
-                      downgradeToStarter();
-                      toast.info("Workspace reset to Starter (Demo).");
-                    }}
-                    className="ml-auto text-xs font-medium text-[var(--text-tertiary)] hover:text-[var(--danger)] transition-colors"
+              {!isAdmin && (
+                <div className="mt-7 pt-5 border-t border-[var(--border)] flex flex-wrap items-center gap-3">
+                  <Link
+                    href="/pricing"
+                    className="px-4 py-2.5 rounded-xl bg-[var(--brand-blue)] text-white text-xs font-semibold inline-flex items-center gap-1.5 hover:opacity-95"
                   >
-                    Downgrade to Starter
-                  </button>
-                )}
-              </div>
+                    <span>Change Plan</span>
+                    <ArrowRight size={14} />
+                  </Link>
+                  <Link
+                    href="/pricing"
+                    className="px-4 py-2.5 rounded-xl bg-[var(--bg-subtle)] border border-[var(--border-strong)] text-[var(--text-primary)] text-xs font-semibold hover:bg-[var(--bg-muted)]"
+                  >
+                    Buy Extra Credits
+                  </Link>
+                  {billing.planId !== "starter" && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        downgradeToStarter();
+                        toast.info("Workspace reset to Starter.");
+                      }}
+                      className="ml-auto text-xs font-medium text-[var(--text-tertiary)] hover:text-[var(--danger)] transition-colors"
+                    >
+                      Downgrade to Starter
+                    </button>
+                  )}
+                </div>
+              )}
             </div>
 
-            {/* Right Quick Shortcuts */}
             <div className="lg:col-span-5 space-y-5">
               <div className="rounded-2xl bg-[var(--bg-surface)] border border-[var(--border)] shadow-sm p-6">
                 <h3 className="font-heading font-bold text-base text-[var(--text-primary)] mb-2">
-                  Ready to verify a candidate?
+                  Ready to verify?
                 </h3>
                 <p className="text-xs text-[var(--text-secondary)] mb-4">
-                  Each forensic run cross-checks resume claims, GitHub repos, academic records, and PDF certificate metadata.
+                  {roleDef.canBulkUpload
+                    ? "Upload resumes in bulk or verify a single candidate with automatic PDF name, email, and GitHub extraction."
+                    : "Cross-check your resume claims against live GitHub repositories and certificate forensics."}
                 </p>
                 <Link
                   href="/verify"
                   className="w-full py-2.5 px-4 rounded-xl bg-[var(--brand-blue-light)] text-[var(--brand-blue)] border border-[var(--brand-blue)]/25 font-semibold text-xs flex items-center justify-center gap-2 hover:opacity-90"
                 >
-                  <span>Launch New Verification</span>
+                  <span>
+                    {roleDef.canBulkUpload
+                      ? "Launch Bulk / Single Verification"
+                      : "Launch New Verification"}
+                  </span>
                   <ArrowRight size={14} />
                 </Link>
               </div>
@@ -467,10 +536,10 @@ function ProfileContent() {
               <div className="rounded-2xl bg-[var(--bg-surface)] border border-[var(--border)] shadow-sm p-6">
                 <div className="flex items-center gap-2 text-[var(--verified)] text-xs font-bold uppercase tracking-wider mb-2">
                   <Lock size={14} />
-                  <span>Session Security Active</span>
+                  <span>Supabase Auth Active</span>
                 </div>
                 <p className="text-xs text-[var(--text-secondary)] leading-relaxed">
-                  Your account session is protected by an HMAC-SHA256 signed <code className="px-1 py-0.5 rounded bg-[var(--bg-subtle)] font-mono">HttpOnly</code> cookie with CSRF protection.
+                  Your session is managed end-to-end by Supabase Auth with PKCE OAuth 2.0 and automatic SSR session refresh cookies.
                 </p>
               </div>
             </div>
@@ -482,13 +551,13 @@ function ProfileContent() {
           <div className="rounded-2xl bg-[var(--bg-surface)] border border-[var(--border)] shadow-sm overflow-hidden">
             <div className="px-6 py-4 border-b border-[var(--border)] flex items-center justify-between">
               <h2 className="font-heading font-bold text-base text-[var(--text-primary)]">
-                Payment History & Receipts
+                Payment History &amp; Receipts
               </h2>
               <Link
                 href="/pricing"
                 className="text-xs font-semibold text-[var(--brand-blue)] hover:underline"
               >
-                + New Purchase
+                + View Plans
               </Link>
             </div>
 
@@ -539,10 +608,9 @@ function ProfileContent() {
           </div>
         )}
 
-        {/* TAB 3: Account & OAuth Security */}
+        {/* TAB 3: Account & Supabase Security */}
         {activeTab === "security" && (
           <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
-            {/* Edit Profile Form */}
             <form
               onSubmit={handleSaveProfile}
               className="lg:col-span-6 rounded-2xl bg-[var(--bg-surface)] border border-[var(--border)] shadow-sm p-6 space-y-4"
@@ -565,7 +633,7 @@ function ProfileContent() {
 
               <div>
                 <label className="block text-xs font-medium text-[var(--text-secondary)] mb-1">
-                  Email Address (Read-only)
+                  Email Address (Managed by Supabase Auth)
                 </label>
                 <input
                   type="email"
@@ -609,57 +677,38 @@ function ProfileContent() {
                 className="px-5 py-2.5 rounded-xl bg-[var(--brand-blue)] text-white text-xs font-semibold hover:opacity-95 disabled:opacity-60 inline-flex items-center gap-2"
               >
                 {savingProfile && <Loader2 size={14} className="animate-spin" />}
-                <span>Save Profile Changes</span>
+                <span>Save to Supabase Profile</span>
               </button>
             </form>
 
-            {/* Connected OAuth & Security Specs */}
             <div className="lg:col-span-6 rounded-2xl bg-[var(--bg-surface)] border border-[var(--border)] shadow-sm p-6 space-y-5">
               <div className="flex items-center gap-2">
                 <KeyRound size={18} className="text-[var(--brand-blue)]" />
                 <h2 className="font-heading font-bold text-lg text-[var(--text-primary)]">
-                  Connected OAuth Providers & Security
+                  Supabase Auth &amp; Connected Providers
                 </h2>
               </div>
 
               <div className="space-y-3">
                 {[
-                  {
-                    id: "google",
-                    name: "Google OAuth 2.0",
-                    connected: user.provider === "google",
-                    configured: providers.google,
-                  },
-                  {
-                    id: "github",
-                    name: "GitHub OAuth 2.0",
-                    connected: user.provider === "github",
-                    configured: providers.github,
-                  },
+                  { id: "google", name: "Google OAuth (Supabase)", connected: user.provider === "google" },
+                  { id: "github", name: "GitHub OAuth (Supabase)", connected: user.provider === "github" },
+                  { id: "email", name: "Email & Password (Supabase)", connected: user.provider === "email" },
                 ].map((p) => (
                   <div
                     key={p.id}
                     className="flex items-center justify-between p-3.5 rounded-xl bg-[var(--bg-subtle)] border border-[var(--border)]"
                   >
-                    <div>
-                      <div className="text-sm font-semibold text-[var(--text-primary)]">
-                        {p.name}
-                      </div>
-                      <div className="text-[11px] text-[var(--text-tertiary)]">
-                        {p.connected
-                          ? "Active sign-in provider for this session"
-                          : p.configured
-                          ? "Configured & ready on server"
-                          : "Add client ID & secret in .env to activate"}
-                      </div>
+                    <div className="text-sm font-semibold text-[var(--text-primary)]">
+                      {p.name}
                     </div>
                     {p.connected ? (
                       <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-[11px] font-bold bg-[var(--verified-bg)] text-[var(--verified)]">
-                        <CheckCircle2 size={12} /> Connected
+                        <CheckCircle2 size={12} /> Active
                       </span>
                     ) : (
                       <span className="px-2.5 py-1 rounded-full text-[11px] font-medium bg-[var(--bg-surface)] border border-[var(--border)] text-[var(--text-tertiary)]">
-                        {p.configured ? "Available" : "Not Set"}
+                        Available
                       </span>
                     )}
                   </div>
@@ -673,20 +722,131 @@ function ProfileContent() {
                 <div className="grid grid-cols-2 gap-2 text-xs text-[var(--text-secondary)]">
                   <div className="flex items-center gap-1.5">
                     <Check size={14} className="text-[var(--verified)]" />
-                    <span>PKCE S256 Challenge</span>
+                    <span>Supabase PKCE Flow</span>
                   </div>
                   <div className="flex items-center gap-1.5">
                     <Check size={14} className="text-[var(--verified)]" />
-                    <span>Timing-Safe CSRF State</span>
+                    <span>SSR Session Middleware</span>
                   </div>
                   <div className="flex items-center gap-1.5">
                     <Check size={14} className="text-[var(--verified)]" />
-                    <span>HttpOnly Signed Cookie</span>
+                    <span>JWT Token Rotation</span>
                   </div>
                   <div className="flex items-center gap-1.5">
                     <Check size={14} className="text-[var(--verified)]" />
-                    <span>Server-Side Token Exchange</span>
+                    <span>Role-Based Permissions</span>
                   </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* TAB 4: Admin Controls (Visible ONLY to Admin Accounts) */}
+        {activeTab === "admin" && isAdmin && (
+          <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
+            <div className="lg:col-span-6 rounded-2xl bg-[var(--bg-surface)] border border-purple-500/30 shadow-sm p-6 space-y-5">
+              <div className="flex items-center gap-2 text-purple-600 dark:text-purple-400">
+                <Crown size={18} />
+                <h2 className="font-heading font-bold text-lg text-[var(--text-primary)]">
+                  Role View Simulator (Testing Controls)
+                </h2>
+              </div>
+              <p className="text-xs text-[var(--text-secondary)]">
+                Switch how the UI behaves while keeping your unlimited Admin credits active. Great for testing both Organization and Individual user flows without logging out.
+              </p>
+
+              <div className="grid grid-cols-3 gap-2">
+                {(
+                  [
+                    { id: "admin", label: "Admin (Full)" },
+                    { id: "org", label: "Org View" },
+                    { id: "individual", label: "Individual View" },
+                  ] as { id: AccountRole; label: string }[]
+                ).map((opt) => (
+                  <button
+                    key={opt.id}
+                    type="button"
+                    onClick={() => {
+                      setAdminViewAs(opt.id);
+                      toast.info(`Admin view switched to: ${opt.label}`);
+                    }}
+                    className={`py-2.5 px-3 rounded-xl text-xs font-semibold border transition-all ${
+                      adminViewAs === opt.id
+                        ? "bg-purple-600 text-white border-purple-600 shadow-sm"
+                        : "bg-[var(--bg-subtle)] text-[var(--text-secondary)] border-[var(--border)] hover:text-[var(--text-primary)]"
+                    }`}
+                  >
+                    {opt.label}
+                  </button>
+                ))}
+              </div>
+
+              <div className="pt-4 border-t border-[var(--border)] flex flex-wrap gap-2.5">
+                <Link
+                  href="/verify"
+                  className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-[var(--brand-blue)] text-white text-xs font-semibold"
+                >
+                  <Layers size={14} /> Test Bulk Upload
+                </Link>
+                <Link
+                  href="/dashboard"
+                  className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-[var(--bg-subtle)] border border-[var(--border-strong)] text-xs font-semibold text-[var(--text-primary)]"
+                >
+                  Open Batch Dashboard
+                </Link>
+                <button
+                  type="button"
+                  onClick={() => {
+                    resetLocalBillingCache();
+                    toast.success("Cleared local demo billing cache.");
+                  }}
+                  className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-[var(--bg-subtle)] border border-[var(--border-strong)] text-xs font-semibold text-[var(--text-secondary)] hover:text-[var(--danger)]"
+                >
+                  <RefreshCw size={13} /> Reset Local Cache
+                </button>
+              </div>
+            </div>
+
+            <div className="lg:col-span-6 rounded-2xl bg-[var(--bg-surface)] border border-[var(--border)] shadow-sm p-6 space-y-4">
+              <div className="flex items-center justify-between">
+                <h2 className="font-heading font-bold text-lg text-[var(--text-primary)] flex items-center gap-2">
+                  <Activity size={18} className="text-[var(--brand-blue)]" />
+                  <span>System &amp; Session Diagnostics</span>
+                </h2>
+                <button
+                  type="button"
+                  onClick={handleCheckApiHealth}
+                  disabled={checkingHealth}
+                  className="px-3 py-1.5 rounded-lg bg-[var(--brand-blue-light)] text-[var(--brand-blue)] text-xs font-semibold inline-flex items-center gap-1.5"
+                >
+                  {checkingHealth && <Loader2 size={12} className="animate-spin" />}
+                  Ping API
+                </button>
+              </div>
+
+              <div className="rounded-xl bg-[var(--bg-subtle)] border border-[var(--border)] p-4 text-xs font-mono space-y-2 text-[var(--text-secondary)]">
+                <div className="flex justify-between gap-2">
+                  <span className="text-[var(--text-tertiary)]">Supabase User ID</span>
+                  <span className="text-[var(--text-primary)] truncate">{user.id}</span>
+                </div>
+                <div className="flex justify-between gap-2">
+                  <span className="text-[var(--text-tertiary)]">Email</span>
+                  <span className="text-[var(--text-primary)]">{user.email}</span>
+                </div>
+                <div className="flex justify-between gap-2">
+                  <span className="text-[var(--text-tertiary)]">Resolved Role</span>
+                  <span className="text-purple-600 dark:text-purple-400 font-bold">ADMIN (UNLIMITED)</span>
+                </div>
+                <div className="flex justify-between gap-2">
+                  <span className="text-[var(--text-tertiary)]">Active UI Mode</span>
+                  <span className="text-[var(--text-primary)] uppercase">{effectiveRole}</span>
+                </div>
+                <div className="flex justify-between gap-2">
+                  <span className="text-[var(--text-tertiary)]">Backend API Status</span>
+                  <span className="text-[var(--verified)] font-bold">
+                    {apiHealth || "Click Ping API to check"}
+                  </span>
                 </div>
               </div>
             </div>
@@ -710,4 +870,3 @@ export default function ProfilePage() {
     </Suspense>
   );
 }
-

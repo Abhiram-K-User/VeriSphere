@@ -124,8 +124,8 @@ function formatBatchTitle(isoDate: string): { dateDay: string; time: string } {
 function DashboardContent() {
   const router = useRouter();
   const searchParams = useSearchParams();
-  const { user, loading: authLoading } = useAuth();
-  const isOrg = user?.accountType === "org";
+  const { user, effectiveRole, loading: authLoading } = useAuth();
+  const isOrg = effectiveRole === "org" || effectiveRole === "admin";
 
   const [apiKey, setApiKey] = useState<string | null>(null);
   const [allJobs, setAllJobs] = useState<any[]>([]);
