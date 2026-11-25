@@ -1,18 +1,33 @@
 "use client";
 
 import Link from "next/link";
-import { usePathname } from "next/navigation";
-import { useEffect, useState } from "react";
-import { ShieldCheck, ArrowRight, Sun, Moon } from "lucide-react";
+import { usePathname, useRouter } from "next/navigation";
+import { useEffect, useState, useRef } from "react";
+import {
+  ArrowRight,
+  Sun,
+  Moon,
+  User,
+  CreditCard,
+  LogOut,
+  LogIn,
+  ChevronDown,
+} from "lucide-react";
 import { useTheme } from "@/components/theme-provider";
+import { useAuth } from "@/components/auth-provider";
 import { motion, AnimatePresence } from "framer-motion";
 import Image from "next/image";
+import { toast } from "sonner";
 
 export function Navbar() {
   const pathname = usePathname();
+  const router = useRouter();
   const [isScrolled, setIsScrolled] = useState(false);
   const { theme, setTheme, mounted } = useTheme();
+  const { user, billing, logout } = useAuth();
   const [hoveredPath, setHoveredPath] = useState<string | null>(null);
+  const [menuOpen, setMenuOpen] = useState(false);
+  const menuRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
     const handleScroll = () => {
@@ -22,11 +37,30 @@ export function Navbar() {
     return () => window.removeEventListener("scroll", handleScroll);
   }, []);
 
+  useEffect(() => {
+    const handleClickOutside = (e: MouseEvent) => {
+      if (menuRef.current && !menuRef.current.contains(e.target as Node)) {
+        setMenuOpen(false);
+      }
+    };
+    document.addEventListener("mousedown", handleClickOutside);
+    return () => document.removeEventListener("mousedown", handleClickOutside);
+  }, []);
+
   const navLinks = [
     { name: "Home", href: "/" },
     { name: "Verify Candidate", href: "/verify" },
     { name: "Dashboard", href: "/dashboard" },
+    { name: "Pricing", href: "/pricing" },
+    { name: "Profile", href: "/profile" },
   ];
+
+  const handleSignOut = async () => {
+    setMenuOpen(false);
+    await logout();
+    toast.success("Signed out safely.");
+    router.push("/login");
+  };
 
   const isLinkActive = (href: string) => {
     if (href === "/") return pathname === "/";
@@ -150,6 +184,104 @@ export function Navbar() {
             </AnimatePresence>
           </motion.button>
 
+          {/* Auth / Profile Control */}
+          {user ? (
+            <div className="relative" ref={menuRef}>
+              <button
+                type="button"
+                onClick={() => setMenuOpen((prev) => !prev)}
+                className="flex items-center gap-2.5 pl-1.5 pr-3 py-1.5 rounded-full border border-[var(--border)] bg-[var(--bg-surface)] hover:border-[var(--border-strong)] transition-colors"
+              >
+                {user.avatarUrl ? (
+                  // eslint-disable-next-line @next/next/no-img-element
+                  <img
+                    src={user.avatarUrl}
+                    alt={user.name}
+                    className="w-7 h-7 rounded-full object-cover"
+                  />
+                ) : (
+                  <div className="w-7 h-7 rounded-full bg-[var(--brand-blue)] text-white text-xs font-bold flex items-center justify-center">
+                    {user.name.slice(0, 2).toUpperCase()}
+                  </div>
+                )}
+                <div className="hidden xl:flex flex-col text-left leading-tight">
+                  <span className="text-xs font-semibold text-[var(--text-primary)] max-w-[110px] truncate">
+                    {user.name}
+                  </span>
+                  <span className="text-[10px] font-bold uppercase tracking-wider text-[var(--brand-blue)]">
+                    {user.accountType === "org" ? "ORG" : "IND"} · {billing.planName}
+                  </span>
+                </div>
+                <ChevronDown size={14} className="text-[var(--text-tertiary)]" />
+              </button>
+
+              <AnimatePresence>
+                {menuOpen && (
+                  <motion.div
+                    initial={{ opacity: 0, y: 8, scale: 0.97 }}
+                    animate={{ opacity: 1, y: 0, scale: 1 }}
+                    exit={{ opacity: 0, y: 8, scale: 0.97 }}
+                    transition={{ duration: 0.15 }}
+                    className="absolute right-0 mt-2 w-60 rounded-2xl bg-[var(--bg-surface)] border border-[var(--border-strong)] shadow-xl py-2 z-50"
+                  >
+                    <div className="px-4 py-2.5 border-b border-[var(--border)]">
+                      <div className="text-xs font-bold text-[var(--text-primary)] truncate">
+                        {user.name}
+                      </div>
+                      <div className="text-[11px] text-[var(--text-tertiary)] truncate">
+                        {user.email}
+                      </div>
+                      <div className="mt-1.5 inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full bg-[var(--brand-blue-light)] text-[var(--brand-blue)] text-[10px] font-bold uppercase">
+                        {billing.planName} ·{" "}
+                        {billing.credits === "Unlimited"
+                          ? "∞ Credits"
+                          : `${billing.credits} Credits`}
+                      </div>
+                    </div>
+
+                    <div className="py-1">
+                      <Link
+                        href="/profile"
+                        onClick={() => setMenuOpen(false)}
+                        className="flex items-center gap-2.5 px-4 py-2 text-xs font-medium text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-subtle)]"
+                      >
+                        <User size={14} />
+                        <span>Profile & Plan Details</span>
+                      </Link>
+                      <Link
+                        href="/pricing"
+                        onClick={() => setMenuOpen(false)}
+                        className="flex items-center gap-2.5 px-4 py-2 text-xs font-medium text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-subtle)]"
+                      >
+                        <CreditCard size={14} />
+                        <span>Upgrade Plan & Billing</span>
+                      </Link>
+                    </div>
+
+                    <div className="pt-1 border-t border-[var(--border)]">
+                      <button
+                        type="button"
+                        onClick={handleSignOut}
+                        className="w-full flex items-center gap-2.5 px-4 py-2 text-xs font-semibold text-[var(--danger)] hover:bg-[var(--danger-bg)] text-left"
+                      >
+                        <LogOut size={14} />
+                        <span>Sign Out</span>
+                      </button>
+                    </div>
+                  </motion.div>
+                )}
+              </AnimatePresence>
+            </div>
+          ) : (
+            <Link
+              href="/login"
+              className="inline-flex items-center gap-1.5 px-4 py-2.5 rounded-xl border border-[var(--border-strong)] bg-[var(--bg-surface)] hover:bg-[var(--bg-subtle)] text-xs font-semibold text-[var(--text-primary)] transition-colors"
+            >
+              <LogIn size={14} />
+              <span>Sign In</span>
+            </Link>
+          )}
+
           {/* CTA Button */}
           <motion.div
             whileHover={{ scale: 1.04, y: -2, boxShadow: "var(--shadow-sm)" }}
@@ -158,7 +290,7 @@ export function Navbar() {
           >
             <Link
               href="/verify"
-              className="inline-flex items-center gap-1.5 bg-[var(--brand-blue)] text-white text-sm font-semibold px-5 py-2.5 rounded-xl hover:bg-blue-700 transition-colors duration-150"
+              className="inline-flex items-center gap-1.5 bg-[var(--brand-blue)] text-white text-sm font-semibold px-4 py-2.5 rounded-xl hover:bg-blue-700 transition-colors duration-150"
             >
               <span>New Verification</span>
               <motion.span

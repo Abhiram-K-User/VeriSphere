@@ -133,23 +133,37 @@ model CandidateSkill {
   @@id([candidateId, skillId, source])
 }
 
+model VerificationBatch {
+  id        String            @id @default(uuid())
+  orgEmail  String?
+  label     String?
+  createdAt DateTime          @default(now())
+  jobs      VerificationJob[]
+
+  @@index([createdAt])
+  @@index([orgEmail])
+}
+
 model VerificationJob {
-  id                  String        @id @default(uuid())
+  id                  String             @id @default(uuid())
   candidateId         String
-  status              JobStatus     @default(QUEUED)
-  startedAt           DateTime      @default(now())
+  batchId             String?
+  status              JobStatus          @default(QUEUED)
+  startedAt           DateTime           @default(now())
   completedAt         DateTime?
   certificateDataJson String?
-  createdAt           DateTime      @default(now())
+  createdAt           DateTime           @default(now())
   errorMsg            String?
   githubMetricsJson   String?
   resumeDataJson      String?
   mongoRef            String?
   report              AuditReport?
   certificates        Certificate[]
-  candidate           Candidate     @relation(fields: [candidateId], references: [id], onDelete: Cascade)
+  candidate           Candidate          @relation(fields: [candidateId], references: [id], onDelete: Cascade)
+  batch               VerificationBatch? @relation(fields: [batchId], references: [id], onDelete: SetNull)
 
   @@index([candidateId])
+  @@index([batchId])
   @@index([status])
   @@index([status, createdAt])
 }

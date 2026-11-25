@@ -3,6 +3,7 @@ import { Rubik, Outfit } from "next/font/google";
 import { GeistMono } from 'geist/font/mono';
 import { Navbar } from "@/components/ui/Navbar";
 import { ThemeProvider } from "@/components/theme-provider";
+import { AuthProvider } from "@/components/auth-provider";
 import { Toaster } from "sonner";
 import "./globals.css";
 
@@ -46,9 +47,11 @@ export default function RootLayout({
       </head>
       <body className="font-sans antialiased bg-[var(--bg-page)] text-[var(--text-primary)] transition-colors duration-250 ease-in-out">
         <ThemeProvider>
-          <Navbar />
-          {children}
-          <Toaster richColors position="top-right" />
+          <AuthProvider>
+            <Navbar />
+            {children}
+            <Toaster richColors position="top-right" />
+          </AuthProvider>
         </ThemeProvider>
       </body>
     </html>

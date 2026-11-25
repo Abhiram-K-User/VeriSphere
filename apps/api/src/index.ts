@@ -59,6 +59,7 @@ const mockJobRepo = {
     const job = await prisma.verificationJob.findUnique({
       where: { id },
       include: {
+        batch: true,
         report: {
           include: {
             riskIndicators: true,
@@ -79,10 +80,11 @@ const mockJobRepo = {
     });
     return mapRelationalJobToLegacyShape(job);
   },
-  create: async (cId: string) => {
+  create: async (cId: string, batchId?: string) => {
     const job = await prisma.verificationJob.create({
       data: {
         candidateId: cId,
+        batchId: batchId || null,
         status: "QUEUED",
       },
     });

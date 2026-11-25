@@ -55,8 +55,9 @@ export class UploadCandidateUseCase {
       githubUrl: request.githubUrl
     });
 
-    // 3. Create job queue entry in DB
-    const job = await this.jobRepo.create(candidate.id);
+    // 3. Create job queue entry in DB (optionally linked to a normalized VerificationBatch)
+    const batchId = (request as any).batchId as string | undefined;
+    const job = await (this.jobRepo as any).create(candidate.id, batchId);
 
     // 4. Trigger asynchronous engine pipeline (non-blocking)
     await this.orchestrator.triggerVerification(job.id, candidate.id, request.resumeFileUrl, (request as any).certificateAnalyses, (request as any).resumeBuffer);

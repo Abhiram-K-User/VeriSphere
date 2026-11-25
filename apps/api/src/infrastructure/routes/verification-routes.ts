@@ -11,6 +11,7 @@ import { UploadCandidateUseCase } from "../../application/use-cases/upload-candi
 import { ValidationError, ResourceNotFoundError } from "../../domain/entities";
 import { authMiddleware } from "../middleware/auth-middleware";
 import { mapRelationalJobToLegacyShape } from "../../application/services/report-mapper";
+import { extractIdentityFromResume } from "../../application/services/resume-identity-extractor";
 import { prisma } from "../db/prisma-client";
 import multer from "multer";
 import path from "path";
@@ -84,6 +85,169 @@ export function createVerificationRouter(
       
       const result = await uploadCandidateUseCase.execute(candidateData);
       return res.status(202).json(result);
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  /**
+   * POST /api/verification/intake/bulk
+   * Organization bulk resume upload: creates a single normalized VerificationBatch,
+   * auto-extracts candidate name, email, institutional email, and GitHub profile from
+   * each resume PDF, and queues verification jobs linked via batchId FK.
+   */
+  router.post(
+    "/intake/bulk",
+    upload.array("resumeFiles", 50),
+    async (req: Request, res: Response, next: NextFunction) => {
+      try {
+        const files = (req.files as Express.Multer.File[] | undefined) || [];
+        if (files.length === 0) {
+          throw new ValidationError("Please upload at least one PDF resume for batch verification.");
+        }
+
+        const orgEmail =
+          typeof req.body.orgEmail === "string" && req.body.orgEmail.trim()
+            ? req.body.orgEmail.trim().toLowerCase()
+            : null;
+        const label =
+          typeof req.body.label === "string" && req.body.label.trim()
+            ? req.body.label.trim().slice(0, 120)
+            : null;
+
+        // 1. Create normalized VerificationBatch record
+        const batch = await prisma.verificationBatch.create({
+          data: {
+            orgEmail,
+            label,
+          },
+        });
+
+        const createdJobs: Array<{
+          jobId: string;
+          candidateId: string;
+          fileName: string;
+          firstName: string;
+          lastName: string;
+          email: string;
+          githubUrl?: string;
+        }> = [];
+        const failedFiles: Array<{ fileName: string; error: string }> = [];
+
+        // 2. Parse each PDF, auto-extract identity, and queue job linked to batch.id
+        for (const file of files) {
+          try {
+            const extracted = await extractIdentityFromResume(file.buffer, file.originalname);
+            const normalizedGh = normalizeGithubUrl(undefined, extracted.githubUrl);
+
+            const result = await uploadCandidateUseCase.execute({
+              firstName: extracted.firstName,
+              lastName: extracted.lastName,
+              email: extracted.email,
+              institutionalEmail: extracted.institutionalEmail,
+              githubUrl: normalizedGh,
+              resumeFileUrl: "",
+              resumeBuffer: file.buffer,
+              certificateUrls: [],
+              certificateAnalyses: [],
+              batchId: batch.id,
+            } as any);
+
+            createdJobs.push({
+              jobId: result.jobId,
+              candidateId: result.candidateId,
+              fileName: file.originalname,
+              firstName: extracted.firstName,
+              lastName: extracted.lastName,
+              email: extracted.email,
+              githubUrl: normalizedGh,
+            });
+          } catch (fileErr: any) {
+            console.error(`[Bulk Intake] Failed for ${file.originalname}:`, fileErr);
+            failedFiles.push({
+              fileName: file.originalname,
+              error: fileErr?.message || "Failed to process resume PDF",
+            });
+          }
+        }
+
+        // Prevent empty orphan batch if all files failed (zero insertion anomaly)
+        if (createdJobs.length === 0) {
+          await prisma.verificationBatch.delete({ where: { id: batch.id } }).catch(() => {});
+          return res.status(400).json({
+            success: false,
+            error: "None of the uploaded PDF resumes could be queued.",
+            failedFiles,
+          });
+        }
+
+        return res.status(202).json({
+          success: true,
+          batch: {
+            id: batch.id,
+            createdAt: batch.createdAt,
+            orgEmail: batch.orgEmail,
+            label: batch.label,
+          },
+          jobs: createdJobs,
+          failedFiles,
+        });
+      } catch (error) {
+        next(error);
+      }
+    }
+  );
+
+  /**
+   * GET /api/verification/batches
+   * Returns all normalized VerificationBatch records with dynamically computed counts.
+   */
+  router.get("/batches", async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const batches = await prisma.verificationBatch.findMany({
+        orderBy: { createdAt: "desc" },
+        include: {
+          jobs: {
+            select: {
+              id: true,
+              status: true,
+              report: {
+                select: {
+                  trustScore: true,
+                },
+              },
+            },
+          },
+        },
+      });
+
+      const formatted = batches.map((b) => {
+        const totalJobs = b.jobs.length;
+        const completedJobs = b.jobs.filter((j) => j.status === "COMPLETED");
+        const failedJobs = b.jobs.filter((j) => j.status === "FAILED");
+        const analyzingJobs = b.jobs.filter((j) => j.status === "ANALYZING" || j.status === "QUEUED");
+        const avgTrustScore =
+          completedJobs.length > 0
+            ? Math.round(
+                completedJobs.reduce((acc, j) => acc + (j.report?.trustScore || 0), 0) /
+                  completedJobs.length
+              )
+            : null;
+
+        return {
+          id: b.id,
+          orgEmail: b.orgEmail,
+          label: b.label,
+          createdAt: b.createdAt,
+          totalJobs,
+          completedCount: completedJobs.length,
+          failedCount: failedJobs.length,
+          analyzingCount: analyzingJobs.length,
+          avgTrustScore,
+        };
+      });
+
+      return res.status(200).json(formatted);
     } catch (error) {
       next(error);
     }
@@ -173,14 +337,21 @@ export function createVerificationRouter(
 
   /**
    * GET /api/verification/dashboard
-   * Returns all recent verification jobs with their candidates and normalized relations for the dashboard.
+   * Returns recent verification jobs (optionally scoped to a single VerificationBatch via ?batchId=).
    */
   router.get("/dashboard", async (req: Request, res: Response, next: NextFunction) => {
     try {
+      const batchId =
+        typeof req.query.batchId === "string" && req.query.batchId.trim()
+          ? req.query.batchId.trim()
+          : undefined;
+
       const jobs = await prisma.verificationJob.findMany({
+        where: batchId ? { batchId } : undefined,
         orderBy: { startedAt: "desc" },
-        take: 50,
+        take: batchId ? 200 : 100,
         include: {
+          batch: true,
           candidate: {
             include: {
               institution: true,
