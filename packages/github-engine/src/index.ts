@@ -26,6 +26,8 @@ import { analyzeContributors } from "./contributorAnalyzer";
 import { computeOwnershipScore } from "./ownershipScorer";
 import { fetchCommitActivity, computeActivityScore } from "./activityScorer";
 import { analyzeTimeline, CommitDatePair } from "./timelineAnalyzer";
+import { scrapeGithubViaGraphQL } from "./graphqlScraper";
+import { getCachedGithubReport, setCachedGithubReport } from "./cache";
 import { MOCK_GITHUB_EVIDENCE_REPORT } from "./mocks/mockData";
 import {
   GithubEvidenceReport,
@@ -125,7 +127,29 @@ export async function scrapeGithubEvidence(
 
   const octokit = getOctokit();
 
-  // --- Step 2: Fetch repositories ---
+  // --- Step 1b: Check Conditional ETag / In-Memory Cache (0 quota cost on 304!) ---
+  const { report: cachedReport, etag } = await getCachedGithubReport(username, octokit);
+  if (cachedReport) {
+    return cachedReport;
+  }
+
+  // --- Step 1c: Fast Path — GitHub GraphQL API v4 (ALL repos + ALL forks in 2 HTTP calls!) ---
+  const hasToken = Boolean(process.env.GITHUB_TOKEN && process.env.GITHUB_TOKEN.trim().length > 0);
+  if (hasToken) {
+    try {
+      const gqlReport = await scrapeGithubViaGraphQL(username, octokit);
+      if (gqlReport) {
+        setCachedGithubReport(username, gqlReport, etag);
+        return gqlReport;
+      }
+    } catch (gqlErr: any) {
+      console.warn(
+        `[github-engine] GraphQL v4 scrape failed for @${username} (${gqlErr?.message || gqlErr}); falling back to parallel REST...`
+      );
+    }
+  }
+
+  // --- Step 2: REST Fallback — Fetch repositories ---
   const repositories: RepositoryEvidence[] = await fetchRepositories(
     username,
     octokit
@@ -160,7 +184,6 @@ export async function scrapeGithubEvidence(
   // In unauthenticated mode (60 req/hr limit), deeply analyze top 6 non-fork recent repos
   // to avoid exhausting the hourly IP quota on the very first candidate, while still recording
   // metadata for all remaining repositories.
-  const hasToken = Boolean(process.env.GITHUB_TOKEN && process.env.GITHUB_TOKEN.trim().length > 0);
   const prioritizedRepos = [...repositories].sort((a, b) => Number(a.isFork) - Number(b.isFork));
   const deepRepos = hasToken ? prioritizedRepos : prioritizedRepos.slice(0, 6);
   const deepRepoNames = new Set(deepRepos.map((r) => r.name));
@@ -297,6 +320,7 @@ export async function scrapeGithubEvidence(
       `skills=${verifiedSkills.length}, flags=${allTimelineFlags.length}`
   );
 
+  setCachedGithubReport(username, report, etag);
   return report;
 }
 

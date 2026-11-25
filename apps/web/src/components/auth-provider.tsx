@@ -346,7 +346,18 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       return;
     }
 
-    refreshSession();
+    // Read local session immediately (0ms, zero remote HTTPS round-trip)
+    supabase.auth
+      .getSession()
+      .then(({ data }) => {
+        syncFromSupabaseUser(data.session?.user || null);
+      })
+      .catch(() => {
+        syncFromSupabaseUser(null);
+      })
+      .finally(() => {
+        setLoading(false);
+      });
 
     const {
       data: { subscription },
@@ -358,7 +369,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     return () => {
       subscription.unsubscribe();
     };
-  }, [refreshSession, syncFromSupabaseUser]);
+  }, [syncFromSupabaseUser]);
 
   const logout = useCallback(async () => {
     const supabase = createSupabaseBrowserClient();

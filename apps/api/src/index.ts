@@ -31,6 +31,27 @@ const mockCandidateRepo = {
     prisma.candidate.findUnique({ where: { email: email.trim().toLowerCase() } }) as any,
   create: async (c: any) => {
     const cleanEmail = (c.email || "test@example.com").trim().toLowerCase();
+    const newGithubUrl = c.githubUrl ? c.githubUrl.trim() : null;
+
+    // Never preserve stale bogus GitHub URLs (e.g. /LinkedIn, /LeetCode, /Built) from earlier runs
+    let githubUpdateValue: string | null | undefined = newGithubUrl || undefined;
+    if (!newGithubUrl) {
+      const existing = await prisma.candidate.findUnique({
+        where: { email: cleanEmail },
+        select: { githubUrl: true },
+      });
+      if (existing?.githubUrl) {
+        const lowerExisting = existing.githubUrl.toLowerCase();
+        if (
+          lowerExisting.endsWith("/linkedin") ||
+          lowerExisting.endsWith("/leetcode") ||
+          lowerExisting.endsWith("/built")
+        ) {
+          githubUpdateValue = null;
+        }
+      }
+    }
+
     const candidate = await prisma.candidate.upsert({
       where: { email: cleanEmail },
       update: {
@@ -38,7 +59,7 @@ const mockCandidateRepo = {
         lastName: (c.lastName || "Doe").trim(),
         institutionalEmail: c.institutionalEmail ? c.institutionalEmail.trim() : undefined,
         phone: c.phone ? c.phone.trim() : undefined,
-        githubUrl: c.githubUrl ? c.githubUrl.trim() : undefined,
+        githubUrl: githubUpdateValue,
       },
       create: {
         firstName: (c.firstName || "John").trim(),
@@ -46,7 +67,7 @@ const mockCandidateRepo = {
         email: cleanEmail,
         institutionalEmail: c.institutionalEmail ? c.institutionalEmail.trim() : null,
         phone: c.phone ? c.phone.trim() : null,
-        githubUrl: c.githubUrl ? c.githubUrl.trim() : null,
+        githubUrl: newGithubUrl,
       },
     });
     return candidate as any;

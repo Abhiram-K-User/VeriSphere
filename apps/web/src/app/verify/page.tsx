@@ -20,6 +20,7 @@ import {
   XCircle,
   ExternalLink,
   Sparkles,
+  FileDown,
 } from "lucide-react";
 import { FileDropZone } from "@/components/ui/FileDropZone";
 import { ProcessingStage } from "@/components/ui/ProcessingStage";
@@ -66,6 +67,7 @@ export default function VerifyPage() {
   const [isBulkSubmitting, setIsBulkSubmitting] = useState(false);
   const [activeBatchId, setActiveBatchId] = useState<string | null>(null);
   const [bulkJobs, setBulkJobs] = useState<BulkQueuedJob[]>([]);
+  const [downloadingSummary, setDownloadingSummary] = useState(false);
 
   // Processing state (single)
   const [isProcessing, setIsProcessing] = useState(false);
@@ -407,6 +409,33 @@ export default function VerifyPage() {
     }
   };
 
+  const handleDownloadBatchSummary = async () => {
+    if (!activeBatchId || !apiKey) return;
+    setDownloadingSummary(true);
+    const toastId = toast.loading("Generating Batch Summary PDF...");
+    try {
+      const res = await fetch(
+        `http://localhost:4000/api/verification/batches/${encodeURIComponent(activeBatchId)}/summary/pdf`,
+        { headers: { "x-api-key": apiKey } }
+      );
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `VeriSphere_Batch_Summary_${activeBatchId.slice(0, 6)}.pdf`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+      toast.success("Batch Summary PDF downloaded!", { id: toastId });
+    } catch {
+      toast.error("Failed to generate batch summary PDF.", { id: toastId });
+    } finally {
+      setDownloadingSummary(false);
+    }
+  };
+
   const currentStep = isProcessing || activeBatchId ? 1 : 0;
 
   if (apiKey === null) return null;
@@ -578,13 +607,28 @@ export default function VerifyPage() {
                   </p>
                 </div>
 
-                <Link
-                  href={`/dashboard?batchId=${encodeURIComponent(activeBatchId)}`}
-                  className="inline-flex items-center gap-2 px-4 py-2.5 rounded-xl bg-[var(--brand-blue)] text-white text-xs font-semibold hover:bg-blue-700 transition-colors shrink-0"
-                >
-                  <span>Open Batch in Dashboard</span>
-                  <ArrowRight size={14} />
-                </Link>
+                <div className="flex flex-wrap items-center gap-2 shrink-0">
+                  <button
+                    type="button"
+                    disabled={downloadingSummary}
+                    onClick={handleDownloadBatchSummary}
+                    className="inline-flex items-center gap-1.5 px-3.5 py-2.5 rounded-xl bg-[var(--bg-subtle)] border border-[var(--border-strong)] text-[var(--text-primary)] hover:bg-[var(--bg-muted)] disabled:opacity-60 text-xs font-semibold transition-colors"
+                  >
+                    {downloadingSummary ? (
+                      <Loader2 size={14} className="animate-spin" />
+                    ) : (
+                      <FileDown size={14} />
+                    )}
+                    <span>Batch Summary PDF</span>
+                  </button>
+                  <Link
+                    href={`/dashboard?batchId=${encodeURIComponent(activeBatchId)}`}
+                    className="inline-flex items-center gap-2 px-4 py-2.5 rounded-xl bg-[var(--brand-blue)] text-white text-xs font-semibold hover:bg-blue-700 transition-colors shrink-0"
+                  >
+                    <span>Open Batch in Dashboard</span>
+                    <ArrowRight size={14} />
+                  </Link>
+                </div>
               </div>
 
               <div className="mt-6 space-y-3">

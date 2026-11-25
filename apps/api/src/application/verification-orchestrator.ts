@@ -8,8 +8,29 @@ import {
 import { Severity, SkillSource } from '@prisma/client';
 import { parsePdfBuffer, verifyAcademicProfile } from '@verisphere/forensics-engine';
 import { prisma } from '../infrastructure/db/prisma-client';
+import { verificationQueue } from './services/verification-queue';
 import fs from 'fs';
 import crypto from 'crypto';
+
+// Debounced Materialized View Refresh — coalesces multiple batch job completions
+// into a single REFRESH MATERIALIZED VIEW call 15s after batch activity settles.
+let mvRefreshTimer: NodeJS.Timeout | null = null;
+function scheduleMaterializedViewRefresh() {
+  if (mvRefreshTimer) {
+    clearTimeout(mvRefreshTimer);
+  }
+  mvRefreshTimer = setTimeout(() => {
+    mvRefreshTimer = null;
+    prisma
+      .$executeRawUnsafe(`REFRESH MATERIALIZED VIEW mv_recruiter_dashboard;`)
+      .then(() => {
+        console.log('[Orchestrator] ✅ Debounced mv_recruiter_dashboard refresh complete.');
+      })
+      .catch((err) => {
+        console.warn('[Orchestrator] Failed to refresh mv_recruiter_dashboard:', err?.message || err);
+      });
+  }, 15_000);
+}
 
 function mapToPrismaSeverity(raw?: string): Severity {
   const upper = String(raw || 'MEDIUM').toUpperCase();
@@ -415,10 +436,8 @@ export class VerificationOrchestrator {
         finalReport.id = createdReport.id;
       }, { maxWait: 15000, timeout: 45000 });
 
-      // Refresh materialized view non-blockingly
-      prisma.$executeRawUnsafe(`REFRESH MATERIALIZED VIEW mv_recruiter_dashboard;`).catch(err => {
-        console.warn('[Orchestrator] Failed to refresh mv_recruiter_dashboard:', err?.message || err);
-      });
+      // Debounced materialized view refresh (coalesced across batch completions)
+      scheduleMaterializedViewRefresh();
       
       console.log(`[Orchestrator] ✅ Verification complete. Final Score: ${roundedTrustScore}`);
     } catch (dbError: any) {
@@ -437,9 +456,10 @@ export class VerificationOrchestrator {
     candidateId: string, 
     resumeFileUrl?: string,
     certificateAnalyses?: any[],
-    resumeBuffer?: Buffer
+    resumeBuffer?: Buffer,
+    preParsedText?: string
   ): Promise<void> {
-    (async () => {
+    verificationQueue.enqueue(`Job ${jobId}`, async () => {
       try {
         console.log(`[Orchestrator] ═══════════════════════════════════════`);
         console.log(`[Orchestrator] Starting pipeline for Job ${jobId}`);
@@ -466,10 +486,13 @@ export class VerificationOrchestrator {
           createdAt: new Date()
         };
 
-        // --- STEP 1: Parse Resume PDF ---
+        // --- STEP 1: Parse Resume PDF (reuse preParsedText if already extracted during bulk intake) ---
         let rawText = `${candidateRecord.firstName} ${candidateRecord.lastName} - Candidate Profile.`;
         
-        if (resumeBuffer) {
+        if (preParsedText && preParsedText.trim().length > 20) {
+          console.log(`[Orchestrator] STEP 1: Reusing pre-parsed resume text (${preParsedText.length} chars).`);
+          rawText = preParsedText;
+        } else if (resumeBuffer) {
           console.log(`[Orchestrator] STEP 1: Parsing uploaded PDF resume from memory buffer.`);
           const parsedPdf = await parsePdfBuffer(resumeBuffer);
           rawText = parsedPdf.rawText;
@@ -599,6 +622,6 @@ export class VerificationOrchestrator {
           console.error(`[Orchestrator] Could not update job to FAILED status:`, e);
         }
       }
-    })();
+    });
   }
 }

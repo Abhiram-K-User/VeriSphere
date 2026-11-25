@@ -25,7 +25,6 @@ export function Navbar() {
   const [isScrolled, setIsScrolled] = useState(false);
   const { theme, setTheme, mounted } = useTheme();
   const { user, billing, logout } = useAuth();
-  const [hoveredPath, setHoveredPath] = useState<string | null>(null);
   const [menuOpen, setMenuOpen] = useState(false);
   const menuRef = useRef<HTMLDivElement | null>(null);
 
@@ -68,33 +67,23 @@ export function Navbar() {
   };
 
   return (
-    <motion.nav
-      className="sticky top-0 z-50 h-[72px] flex items-center backdrop-blur-[16px] bg-[var(--bg-nav)] font-heading"
-      animate={{
-        borderBottomWidth: isScrolled ? 1 : 1,
-        borderBottomColor: isScrolled ? "var(--border-strong)" : "var(--border)",
-        boxShadow: isScrolled
-          ? "0 1px 12px rgba(0,0,0,0.06), 0 0 0 1px var(--border-strong)"
-          : "0 0 0 1px var(--border)",
-      }}
-      transition={{ duration: 0.3, ease: "easeOut" }}
-      style={{ borderBottomStyle: "solid" }}
+    <nav
+      className={`sticky top-0 z-50 h-[72px] flex items-center backdrop-blur-md bg-[var(--bg-nav)] font-heading border-b transition-shadow duration-200 ${
+        isScrolled
+          ? "border-[var(--border-strong)] shadow-[0_1px_12px_rgba(0,0,0,0.06)]"
+          : "border-[var(--border)]"
+      }`}
     >
       <div className="w-full max-w-[1280px] mx-auto px-8 flex items-center justify-between">
         
         {/* Left Section: Logo & Subtitle */}
-        <Link href="/" className="flex items-center gap-3 select-none group">
-          <motion.div
-            whileHover={{ scale: 1.08, y: -2, rotate: -2, boxShadow: "var(--shadow-sm)" }}
-            whileTap={{ scale: 0.95, y: 0, rotate: 0 }}
-            transition={{ type: "spring", stiffness: 400, damping: 15 }}
-            className="w-12 h-12 rounded-xl overflow-hidden flex items-center justify-center shadow-sm border border-[var(--border)] relative bg-white shrink-0"
-          >
+        <Link href="/" prefetch={true} className="flex items-center gap-3 select-none group">
+          <div className="w-12 h-12 rounded-xl overflow-hidden flex items-center justify-center shadow-sm border border-[var(--border)] relative bg-white shrink-0 transition-transform duration-200 group-hover:scale-105">
             <Image src="/logo.png" alt="VeriSphere Logo" width={48} height={48} className="object-contain w-full h-full scale-[2.2]" />
-          </motion.div>
+          </div>
           <div className="flex flex-col">
             <div className="flex items-baseline leading-none">
-              <span className="font-heading font-bold text-2xl text-[var(--brand-navy)] tracking-tight group-hover:text-[var(--brand-blue)] transition-colors duration-300">VeriSphere</span>
+              <span className="font-heading font-bold text-2xl text-[var(--brand-navy)] tracking-tight group-hover:text-[var(--brand-blue)] transition-colors duration-200">VeriSphere</span>
             </div>
             <span className="text-[11px] font-heading font-medium text-[var(--text-tertiary)] mt-1 tracking-wide uppercase">
               Candidate Verification Intelligence
@@ -103,43 +92,26 @@ export function Navbar() {
         </Link>
 
         {/* Center Navigation */}
-        <div className="flex items-center gap-1" onMouseLeave={() => setHoveredPath(null)}>
+        <div className="flex items-center gap-1">
           {navLinks.map((link) => {
             const active = isLinkActive(link.href);
-            const isHovered = hoveredPath === link.href;
 
             return (
               <Link
                 key={link.name}
                 href={link.href}
-                onMouseEnter={() => setHoveredPath(link.href)}
-                className={`relative px-4 py-2 text-[14px] font-heading rounded-full transition-colors duration-300 ${
+                prefetch={true}
+                className={`relative px-4 py-2 text-[14px] font-heading rounded-full transition-colors duration-150 ${
                   active
                     ? "text-[var(--brand-blue)] font-semibold"
-                    : "text-[var(--text-secondary)] hover:text-[var(--text-primary)] font-medium"
+                    : "text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-subtle)] font-medium"
                 }`}
               >
-                {/* Hover background pill */}
-                {isHovered && (
-                  <motion.span
-                    layoutId="navbar-hover"
-                    className="absolute inset-0 bg-[var(--bg-subtle)] rounded-full -z-10"
-                    initial={{ opacity: 0, scale: 0.95 }}
-                    animate={{ opacity: 1, scale: 1 }}
-                    exit={{ opacity: 0, scale: 0.95 }}
-                    transition={{ type: "spring", stiffness: 400, damping: 25 }}
-                  />
-                )}
-
                 <span className="relative z-10">{link.name}</span>
 
-                {/* Sliding active indicator */}
+                {/* Active indicator */}
                 {active && (
-                  <motion.span
-                    layoutId="active-nav-indicator"
-                    className="absolute bottom-[-16px] left-4 right-4 h-[3px] bg-[var(--brand-blue)] rounded-t-full z-10"
-                    transition={{ type: "spring", stiffness: 350, damping: 25 }}
-                  />
+                  <span className="absolute bottom-[-16px] left-4 right-4 h-[3px] bg-[var(--brand-blue)] rounded-t-full z-10" />
                 )}
               </Link>
             );
@@ -295,17 +267,12 @@ export function Navbar() {
               className="inline-flex items-center gap-1.5 bg-[var(--brand-blue)] text-white text-sm font-semibold px-4 py-2.5 rounded-xl hover:bg-blue-700 transition-colors duration-150"
             >
               <span>New Verification</span>
-              <motion.span
-                animate={{ x: [0, 3, 0] }}
-                transition={{ duration: 1.2, repeat: Infinity, ease: "easeInOut", repeatDelay: 0.8 }}
-              >
-                <ArrowRight size={15} strokeWidth={2.5} />
-              </motion.span>
+              <ArrowRight size={15} strokeWidth={2.5} />
             </Link>
           </motion.div>
         </div>
 
       </div>
-    </motion.nav>
+    </nav>
   );
 }
