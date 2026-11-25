@@ -2,11 +2,14 @@
  * @file resume-identity-extractor.ts
  * @package apps/api
  * @purpose Automatically extracts candidate name (firstName, lastName), email, institutionalEmail,
- *          and GitHub profile URL from an uploaded resume PDF buffer using decompressed PDF
- *          hyperlink annotations (via pdf-parse/pdfjs) plus raw URI fallback & text parsing.
+ *          and GitHub profile URL from an uploaded resume PDF buffer using:
+ *            1. Decompressed PDF hyperlink annotations via pdf.js (parsePdfBuffer().links)
+ *            2. Zlib FlateDecode stream decompression fallback for compressed PDF /URI objects
+ *            3. Raw uncompressed /URI & plain text github.com/<username> scanning
  */
 
 import crypto from "crypto";
+import zlib from "zlib";
 import { parsePdfBuffer } from "@verisphere/forensics-engine";
 
 export interface ExtractedCandidateIdentity {
@@ -48,7 +51,7 @@ const RESERVED_GITHUB_PATHS = new Set([
   "readme",
   "solutions",
   "team",
-  // Common resume header labels that must NEVER be mistaken for GitHub handles
+  // Resume header labels & English prose words that must NEVER be mistaken for a GitHub handle
   "linkedin",
   "leetcode",
   "codeforces",
@@ -74,6 +77,30 @@ const RESERVED_GITHUB_PATHS = new Set([
   "http",
   "https",
   "www",
+  "built",
+  "developed",
+  "created",
+  "designed",
+  "implemented",
+  "engineered",
+  "deployed",
+  "using",
+  "with",
+  "and",
+  "for",
+  "the",
+  "repo",
+  "repository",
+  "project",
+  "projects",
+  "code",
+  "source",
+  "demo",
+  "live",
+  "open",
+  "view",
+  "here",
+  "click",
 ]);
 
 const SKIP_NAME_PATTERNS = [
@@ -123,32 +150,107 @@ function isInstitutionalEmail(email: string): boolean {
   );
 }
 
-function extractRawUrisFromPdfBuffer(buffer: Buffer): string[] {
-  const latin1 = buffer.toString("latin1");
-  const uris: string[] = [];
-  const uriRegex = /\/URI\s*\(([^)]+)\)/gi;
+function extractUrisFromString(text: string, out: Set<string>): void {
+  // Match standard PDF /URI (https://...) annotations
+  const parenRegex = /\/URI\s*\(([^)]+)\)/gi;
   let match: RegExpExecArray | null;
-  while ((match = uriRegex.exec(latin1)) !== null) {
+  while ((match = parenRegex.exec(text)) !== null) {
     if (match[1]) {
-      uris.push(match[1].replace(/\\([()\\])/g, "$1").trim());
+      out.add(match[1].replace(/\\([()\\])/g, "$1").trim());
     }
   }
-  return uris;
+
+  // Match PDF hex-encoded /URI <68747470...> annotations
+  const hexRegex = /\/URI\s*<([0-9a-fA-F\s]+)>/gi;
+  while ((match = hexRegex.exec(text)) !== null) {
+    if (match[1]) {
+      try {
+        const cleanHex = match[1].replace(/\s+/g, "");
+        const decoded = Buffer.from(cleanHex, "hex").toString("utf8").replace(/\0/g, "").trim();
+        if (decoded) out.add(decoded);
+      } catch {
+        // ignore invalid hex
+      }
+    }
+  }
+
+  // Also grab any explicit github.com/<user> URLs inside decompressed PDF objects
+  const ghUrlRegex = /https?:\/\/(?:www\.)?github\.com\/[a-zA-Z0-9-]+(?:\/[a-zA-Z0-9._-]+)?/gi;
+  while ((match = ghUrlRegex.exec(text)) !== null) {
+    if (match[0]) out.add(match[0].trim());
+  }
 }
 
-function isValidGithubUsername(username: string): boolean {
+/**
+ * Extracts /URI hyperlinks from BOTH uncompressed PDF objects AND zlib/FlateDecode
+ * compressed PDF streams (common in Overleaf/LaTeX and Chrome-generated PDFs).
+ */
+function extractDeepUrisFromPdfBuffer(buffer: Buffer): string[] {
+  const uris = new Set<string>();
+  const latin1 = buffer.toString("latin1");
+
+  // 1. Scan uncompressed PDF body
+  extractUrisFromString(latin1, uris);
+
+  // 2. Scan and inflate every compressed stream ... endstream block
+  let pos = 0;
+  const streamToken = Buffer.from("stream");
+  const endStreamToken = Buffer.from("endstream");
+
+  while (pos < buffer.length) {
+    const startIdx = buffer.indexOf(streamToken, pos);
+    if (startIdx === -1) break;
+
+    // Advance past "stream" + optional \r\n or \n
+    let dataStart = startIdx + streamToken.length;
+    if (buffer[dataStart] === 0x0d && buffer[dataStart + 1] === 0x0a) {
+      dataStart += 2;
+    } else if (buffer[dataStart] === 0x0a || buffer[dataStart] === 0x0d) {
+      dataStart += 1;
+    } else {
+      pos = startIdx + streamToken.length;
+      continue;
+    }
+
+    const endIdx = buffer.indexOf(endStreamToken, dataStart);
+    if (endIdx === -1) break;
+
+    const slice = buffer.subarray(dataStart, endIdx);
+    // Only try inflating reasonable stream sizes (< 2 MB)
+    if (slice.length > 8 && slice.length < 2 * 1024 * 1024) {
+      try {
+        const inflated = zlib.inflateSync(slice).toString("latin1");
+        if (inflated.includes("URI") || inflated.includes("github.com") || inflated.includes("mailto:")) {
+          extractUrisFromString(inflated, uris);
+        }
+      } catch {
+        // Not a FlateDecode stream or raw deflate — try inflateRawSync once
+        try {
+          const inflatedRaw = zlib.inflateRawSync(slice).toString("latin1");
+          if (inflatedRaw.includes("URI") || inflatedRaw.includes("github.com")) {
+            extractUrisFromString(inflatedRaw, uris);
+          }
+        } catch {
+          // Non-zlib stream (e.g. font/image), skip
+        }
+      }
+    }
+
+    pos = endIdx + endStreamToken.length;
+  }
+
+  return Array.from(uris);
+}
+
+export function isValidGithubUsername(username: string): boolean {
   const clean = username.trim();
-  if (!clean || clean.length > 39) return false;
+  if (!clean || clean.length < 2 || clean.length > 39) return false;
   if (!/^[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,37}[a-zA-Z0-9])?$/.test(clean)) return false;
   if (RESERVED_GITHUB_PATHS.has(clean.toLowerCase())) return false;
   return true;
 }
 
 function extractGithubUrl(rawText: string, pdfLinks: string[]): string | undefined {
-  // Score every github.com/<username> occurrence:
-  // - Direct profile URLs (https://github.com/user or /user/) get +3 weight
-  // - Project repo URLs (https://github.com/user/repo) get +2 weight
-  // - Text matches get +1 weight
   const scores = new Map<string, { canonical: string; weight: number }>();
 
   const addCandidate = (rawUser: string, weight: number) => {
@@ -162,7 +264,7 @@ function extractGithubUrl(rawText: string, pdfLinks: string[]): string | undefin
     }
   };
 
-  // 1. Inspect decompressed PDF hyperlink annotations + raw /URI strings first (most accurate)
+  // 1. Inspect decompressed PDF hyperlink annotations + inflated /URI objects (highest authority)
   const linkGhRegex =
     /^(?:https?:\/\/)?(?:www\.)?github\.com\/([a-zA-Z0-9-]+)(\/[^?#\s]*)?/i;
 
@@ -171,7 +273,8 @@ function extractGithubUrl(rawText: string, pdfLinks: string[]): string | undefin
     const match = trimmed.match(linkGhRegex);
     if (match && match[1]) {
       const hasSubpath = Boolean(match[2] && match[2] !== "/");
-      addCandidate(match[1], hasSubpath ? 2 : 4);
+      // Direct profile link gets +5; repo links (e.g. 4 project links by the same author) get +2 each
+      addCandidate(match[1], hasSubpath ? 2 : 5);
     }
   }
 
@@ -182,7 +285,7 @@ function extractGithubUrl(rawText: string, pdfLinks: string[]): string | undefin
   let textMatch: RegExpExecArray | null;
   while ((textMatch = textGhRegex.exec(rawText)) !== null) {
     if (textMatch[1]) {
-      addCandidate(textMatch[1], 2);
+      addCandidate(textMatch[1], 3);
     }
   }
 
@@ -198,12 +301,13 @@ function extractGithubUrl(rawText: string, pdfLinks: string[]): string | undefin
     }
   }
 
-  // 3. Safe fallback ONLY for explicit "GitHub: username" or "GitHub - @username"
-  //    (intentionally excludes "|" pipe so "GitHub | LinkedIn" or "GitHub | LeetCode" NEVER matches!)
-  const labelRegex = /\bgithub\s*(?::|—|–|-)\s*@?([a-zA-Z0-9](?:[a-zA-Z0-9-]{0,37}[a-zA-Z0-9])?)\b/i;
-  const labelMatch = rawText.match(labelRegex);
-  if (labelMatch?.[1] && isValidGithubUsername(labelMatch[1])) {
-    return `https://github.com/${labelMatch[1]}`;
+  // 3. Strict header-only fallback: ONLY matches explicit "GitHub: username" or "GitHub: @username"
+  //    in the top 10 lines of the resume (NEVER dashes/pipes that appear in project bullets!).
+  const headerLines = rawText.split(/\r?\n/).slice(0, 10).join("\n");
+  const colonRegex = /\bgithub\s*:\s*@?([a-zA-Z0-9](?:[a-zA-Z0-9-]{0,37}[a-zA-Z0-9])?)\b/i;
+  const colonMatch = headerLines.match(colonRegex);
+  if (colonMatch?.[1] && isValidGithubUsername(colonMatch[1])) {
+    return `https://github.com/${colonMatch[1]}`;
   }
 
   return undefined;
@@ -304,18 +408,19 @@ export async function extractIdentityFromResume(
   fileName: string = "resume.pdf"
 ): Promise<ExtractedCandidateIdentity> {
   let rawText = "";
-  let decompressedLinks: string[] = [];
+  let pdfJsLinks: string[] = [];
 
   try {
     const parsed = await parsePdfBuffer(pdfBuffer);
     rawText = parsed.rawText || "";
-    decompressedLinks = Array.isArray(parsed.links) ? parsed.links : [];
+    pdfJsLinks = Array.isArray(parsed.links) ? parsed.links : [];
   } catch (err) {
     console.warn(`[ResumeExtractor] PDF parse failed for ${fileName}:`, (err as Error).message);
   }
 
-  const rawBufferLinks = extractRawUrisFromPdfBuffer(pdfBuffer);
-  const allLinks = Array.from(new Set([...decompressedLinks, ...rawBufferLinks]));
+  // Deep scan BOTH uncompressed & FlateDecode-compressed PDF streams for /URI links
+  const deepBufferLinks = extractDeepUrisFromPdfBuffer(pdfBuffer);
+  const allLinks = Array.from(new Set([...pdfJsLinks, ...deepBufferLinks]));
 
   const { email: extractedEmail, institutionalEmail } = extractEmails(rawText, allLinks);
   const githubUrl = extractGithubUrl(rawText, allLinks);
@@ -333,7 +438,8 @@ export async function extractIdentityFromResume(
   }
 
   console.log(
-    `[ResumeExtractor] ${fileName} -> ${firstName} ${lastName} | ${finalEmail} | ${githubUrl || "no-github"} (links found: ${allLinks.length})`
+    `[ResumeExtractor] ${fileName} -> ${firstName} ${lastName} | ${finalEmail} | ${githubUrl || "no-github"} ` +
+      `(pdfJsLinks=${pdfJsLinks.length}, deepStreamLinks=${deepBufferLinks.length})`
   );
 
   return {
