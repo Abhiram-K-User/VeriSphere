@@ -2,18 +2,13 @@
  * @file techDetector.ts
  * @package @verisphere/github-engine
  * @purpose Evidence-based technology detection per repository.
- *          Uses actual repo file contents (package.json + config files).
- *          Never uses repository descriptions.
+ *          Shared parsing helpers used by BOTH the GitHub GraphQL v4 scraper
+ *          and the parallelized REST fallback scraper.
  */
 
 import { Octokit } from "@octokit/rest";
 
-// ---------------------------------------------------------------------------
-// Mapping tables (from spec)
-// ---------------------------------------------------------------------------
-
-/** npm package name → human-readable technology label */
-const PACKAGE_NAME_MAP: Record<string, string> = {
+export const PACKAGE_NAME_MAP: Record<string, string> = {
   react: "React",
   "react-dom": "React",
   next: "Next.js",
@@ -67,10 +62,10 @@ const PACKAGE_NAME_MAP: Record<string, string> = {
   truffle: "Blockchain",
   "framer-motion": "Framer Motion",
   axios: "Axios",
+  three: "Three.js",
 };
 
-/** Python requirement name → human-readable technology label */
-const PYTHON_PACKAGE_MAP: Record<string, string> = {
+export const PYTHON_PACKAGE_MAP: Record<string, string> = {
   flask: "Flask",
   "flask-cors": "Flask",
   django: "Django",
@@ -96,11 +91,16 @@ const PYTHON_PACKAGE_MAP: Record<string, string> = {
   pymongo: "MongoDB",
   supabase: "Supabase",
   firebase_admin: "Firebase",
+  "firebase-admin": "Firebase",
   transformers: "Hugging Face / Transformers",
+  langchain: "LangChain",
+  langgraph: "LangGraph",
+  chromadb: "ChromaDB",
+  groq: "Groq API",
+  uvicorn: "FastAPI",
 };
 
-/** Config file name → technology label */
-const FILE_TECH_MAP: Record<string, string> = {
+export const FILE_TECH_MAP: Record<string, string> = {
   Dockerfile: "Docker",
   "docker-compose.yml": "Docker",
   "docker-compose.yaml": "Docker",
@@ -126,8 +126,9 @@ const FILE_TECH_MAP: Record<string, string> = {
   "foundry.toml": "Blockchain",
   "anchor.toml": "Blockchain",
   "brownie-config.yaml": "Blockchain",
-  "Makefile": "Makefile",
+  Makefile: "Makefile",
   "CMakeLists.txt": "C / C++",
+  "firebase.json": "Firebase",
 };
 
 interface PackageJson {
@@ -136,7 +137,7 @@ interface PackageJson {
   peerDependencies?: Record<string, string>;
 }
 
-function parsePackageJsonContent(content: string, techs: Set<string>) {
+export function parsePackageJsonContent(content: string, techs: Set<string>): void {
   try {
     const pkg = JSON.parse(content) as PackageJson;
     const allDeps = {
@@ -160,7 +161,7 @@ function parsePackageJsonContent(content: string, techs: Set<string>) {
   }
 }
 
-function parseRequirementsContent(content: string, techs: Set<string>) {
+export function parseRequirementsContent(content: string, techs: Set<string>): void {
   try {
     const lines = content.split(/\r?\n/);
     for (const line of lines) {
@@ -179,6 +180,62 @@ function parseRequirementsContent(content: string, techs: Set<string>) {
   }
 }
 
+export function applyLanguageAndFileHeuristics(
+  techs: Set<string>,
+  primaryLanguage?: string | null,
+  languages?: string[],
+  rootFileNames?: Iterable<string>
+): void {
+  const addLang = (lang?: string | null) => {
+    if (!lang) return;
+    const lower = lang.toLowerCase();
+    if (lower === "solidity") {
+      techs.add("Solidity");
+      techs.add("Blockchain");
+    } else if (lower === "python") {
+      techs.add("Python");
+    } else if (lower === "c") {
+      techs.add("C");
+    } else if (lower === "c++" || lower === "cpp") {
+      techs.add("C++");
+    } else if (lower === "kotlin") {
+      techs.add("Kotlin");
+    } else if (lower !== "unknown" && lower !== "undefined") {
+      techs.add(lang);
+    }
+  };
+
+  addLang(primaryLanguage);
+  if (languages) {
+    for (const l of languages) addLang(l);
+  }
+
+  if (rootFileNames) {
+    for (const fileName of rootFileNames) {
+      if (fileName.endsWith(".sol")) {
+        techs.add("Solidity");
+        techs.add("Blockchain");
+      } else if (fileName.endsWith(".py")) {
+        techs.add("Python");
+      } else if (fileName.endsWith(".c") || fileName.endsWith(".h")) {
+        techs.add("C");
+      } else if (fileName.endsWith(".cpp") || fileName.endsWith(".hpp")) {
+        techs.add("C++");
+      } else if (fileName.endsWith(".kt")) {
+        techs.add("Kotlin");
+      }
+      if (FILE_TECH_MAP[fileName]) {
+        techs.add(FILE_TECH_MAP[fileName]);
+      }
+    }
+  }
+}
+
+/**
+ * Parallelized REST fallback technology detector (used only when GraphQL v4 is unavailable,
+ * e.g. unauthenticated mode). Runs all root & subdirectory manifest fetches concurrently
+ * via Promise.allSettled instead of sequential loops.
+ */
 export async function detectTechnologies(
   username: string,
   repoName: string,
@@ -186,27 +243,9 @@ export async function detectTechnologies(
   primaryLanguage?: string
 ): Promise<string[]> {
   const techs = new Set<string>();
-
-  if (primaryLanguage) {
-    const langLower = primaryLanguage.toLowerCase();
-    if (langLower === "solidity") {
-      techs.add("Solidity");
-      techs.add("Blockchain");
-    } else if (langLower === "python") {
-      techs.add("Python");
-    } else if (langLower === "c") {
-      techs.add("C");
-    } else if (langLower === "c++" || langLower === "cpp") {
-      techs.add("C++");
-    } else if (langLower === "kotlin") {
-      techs.add("Kotlin");
-    } else if (langLower !== "unknown" && langLower !== "undefined") {
-      techs.add(primaryLanguage);
-    }
-  }
+  applyLanguageAndFileHeuristics(techs, primaryLanguage);
 
   try {
-    // Fetch root directory contents in a single call to check for files
     const response = await octokit.rest.repos.getContent({
       owner: username,
       repo: repoName,
@@ -216,100 +255,50 @@ export async function detectTechnologies(
     const rootItems = response.data;
     if (Array.isArray(rootItems)) {
       const rootFiles = new Set(rootItems.map((item) => item.name));
-      const subdirs = rootItems.filter((item) => item.type === "dir").map((item) => item.name);
+      const subdirs = rootItems
+        .filter((item) => item.type === "dir")
+        .map((item) => item.name);
 
-      // Scan root files for extensions
-      for (const fileName of rootFiles) {
-        if (fileName.endsWith(".sol")) {
-          techs.add("Solidity");
-          techs.add("Blockchain");
-        } else if (fileName.endsWith(".py")) {
-          techs.add("Python");
-        } else if (fileName.endsWith(".c") || fileName.endsWith(".h")) {
-          techs.add("C");
-        } else if (fileName.endsWith(".cpp") || fileName.endsWith(".hpp")) {
-          techs.add("C++");
-        } else if (fileName.endsWith(".kt")) {
-          techs.add("Kotlin");
+      applyLanguageAndFileHeuristics(techs, undefined, undefined, rootFiles);
+
+      // Build parallel fetch tasks for root + existing target subdirectories
+      const fetchTasks: Promise<void>[] = [];
+
+      const fetchFileAndParse = async (filePath: string, kind: "pkg" | "req") => {
+        try {
+          const res = await octokit.rest.repos.getContent({
+            owner: username,
+            repo: repoName,
+            path: filePath,
+          });
+          const fileData = res.data;
+          if (!Array.isArray(fileData) && fileData.type === "file" && "content" in fileData) {
+            const decoded = Buffer.from(fileData.content, "base64").toString("utf-8");
+            if (kind === "pkg") parsePackageJsonContent(decoded, techs);
+            else parseRequirementsContent(decoded, techs);
+          }
+        } catch {
+          // File not present — silently ignore
         }
-      }
+      };
 
-      // 1. Check for config files from the mapping table
-      for (const [fileName, techName] of Object.entries(FILE_TECH_MAP)) {
-        if (rootFiles.has(fileName)) {
-          techs.add(techName);
-        }
-      }
-
-      // 2. Parse requirements.txt if present
       if (rootFiles.has("requirements.txt")) {
-        try {
-          const reqRes = await octokit.rest.repos.getContent({
-            owner: username,
-            repo: repoName,
-            path: "requirements.txt",
-          });
-          const fileData = reqRes.data;
-          if (!Array.isArray(fileData) && fileData.type === "file") {
-            const decoded = Buffer.from(fileData.content, "base64").toString("utf-8");
-            parseRequirementsContent(decoded, techs);
-          }
-        } catch {
-          // ignore
-        }
+        fetchTasks.push(fetchFileAndParse("requirements.txt", "req"));
       }
-
-      // 3. Parse root package.json if it exists
       if (rootFiles.has("package.json")) {
-        try {
-          const pkgResponse = await octokit.rest.repos.getContent({
-            owner: username,
-            repo: repoName,
-            path: "package.json",
-          });
-          const fileData = pkgResponse.data;
-          if (!Array.isArray(fileData) && fileData.type === "file") {
-            const decoded = Buffer.from(fileData.content, "base64").toString("utf-8");
-            parsePackageJsonContent(decoded, techs);
-          }
-        } catch {
-          // ignore
+        fetchTasks.push(fetchFileAndParse("package.json", "pkg"));
+      }
+
+      const targetSubdirs = new Set(["frontend", "client", "web", "backend", "api", "server"]);
+      for (const dir of subdirs) {
+        if (targetSubdirs.has(dir.toLowerCase())) {
+          fetchTasks.push(fetchFileAndParse(`${dir}/package.json`, "pkg"));
+          fetchTasks.push(fetchFileAndParse(`${dir}/requirements.txt`, "req"));
         }
       }
 
-      // 4. Check subdirectories (frontend, client, web, backend, api) for package.json or requirements.txt
-      const targetSubdirs = ["frontend", "client", "web", "backend", "api", "server"];
-      for (const dir of subdirs) {
-        if (targetSubdirs.includes(dir.toLowerCase())) {
-          try {
-            const subPkg = await octokit.rest.repos.getContent({
-              owner: username,
-              repo: repoName,
-              path: `${dir}/package.json`,
-            });
-            const subData = subPkg.data;
-            if (!Array.isArray(subData) && subData.type === "file") {
-              const decoded = Buffer.from(subData.content, "base64").toString("utf-8");
-              parsePackageJsonContent(decoded, techs);
-            }
-          } catch {
-            // sub package.json not found, try requirements.txt
-            try {
-              const subReq = await octokit.rest.repos.getContent({
-                owner: username,
-                repo: repoName,
-                path: `${dir}/requirements.txt`,
-              });
-              const subReqData = subReq.data;
-              if (!Array.isArray(subReqData) && subReqData.type === "file") {
-                const decoded = Buffer.from(subReqData.content, "base64").toString("utf-8");
-                parseRequirementsContent(decoded, techs);
-              }
-            } catch {
-              // ignore
-            }
-          }
-        }
+      if (fetchTasks.length > 0) {
+        await Promise.allSettled(fetchTasks);
       }
     }
   } catch (error) {
@@ -321,4 +310,3 @@ export async function detectTechnologies(
 
   return Array.from(techs).sort();
 }
-

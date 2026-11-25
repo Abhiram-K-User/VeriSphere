@@ -1,77 +1,121 @@
 /**
  * @file gemini.ts
  * @package @verisphere/ai-layer
- * @purpose Configures the Google Gen AI SDK connection using Gemini 1.5 Flash, structured outputs (JSON schema), and error handling.
- * @dependencies @google/generative-ai, zod
- * @security Never hardcode API keys. Retrieve securely via process.env.GEMINI_API_KEY.
- * @future_implementation Implement Exponential Backoff retry handler and token-based rate limiters to handle heavy concurrent analysis jobs.
+ * @purpose Real Google Generative AI (Gemini 2.0 Flash) provider for Dual-Provider AI Pool.
+ *          Activated automatically whenever GEMINI_API_KEY is configured in .env.
  */
 
-import { GoogleGenerativeAI } from "@google/generative-ai"; // Mocking import from official SDK
-import { ZodSchema } from "zod";
+import { GoogleGenerativeAI } from "@google/generative-ai";
+import { AuditReport } from "@verisphere/shared-types";
 
-export interface GeminiConfig {
-  apiKey: string;
-  defaultModel: string; // e.g. "gemini-1.5-flash"
-  maxRetries: number;
+function compactResumeText(raw: string, maxChars: number): string {
+  const normalized = (raw || "")
+    .replace(/\r/g, "\n")
+    .replace(/[ \t]+/g, " ")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+  if (normalized.length <= maxChars) return normalized;
+  return normalized.slice(0, maxChars) + "\n...[truncated]";
+}
+
+function compactGithubForGemini(metrics: any): any {
+  if (!metrics || typeof metrics !== "object") return metrics;
+  const repos = Array.isArray(metrics.analyzedRepos) ? metrics.analyzedRepos : [];
+  return {
+    user: metrics.githubUsername,
+    reposCount: metrics.publicReposCount ?? repos.length,
+    ageMonths: metrics.accountAgeMonths,
+    totalCommits: metrics.totalCommitsCollected ?? 0,
+    verifiedSkills: Array.isArray(metrics.verifiedSkills) ? metrics.verifiedSkills : [],
+    verifiedLanguages: Array.isArray(metrics.verifiedLanguages) ? metrics.verifiedLanguages : [],
+    langDist: metrics.languageDistribution || {},
+    hasTimelineGaps: Boolean(metrics.hasTimelineGaps),
+    alerts: Array.isArray(metrics.timelineAnomalyAlerts)
+      ? Array.from(new Set(metrics.timelineAnomalyAlerts)).slice(0, 10)
+      : [],
+    repos: repos.map((r: any) => ({
+      name: r.name,
+      lang: r.language || "Unknown",
+      commits: r.commits || 0,
+      tech: Array.isArray(r.technologies) ? r.technologies : [],
+      msgs: Array.isArray(r.recentCommits)
+        ? r.recentCommits.slice(0, 2).map((m: string) => String(m).slice(0, 60))
+        : [],
+    })),
+  };
 }
 
 export class GeminiProvider {
-  private client: any; // Type as GoogleGenerativeAI client
-  private config: GeminiConfig;
+  private genAI: GoogleGenerativeAI | null = null;
+  private modelName: string;
 
-  constructor(config: GeminiConfig) {
-    this.config = config;
-    if (!config.apiKey) {
-      throw new Error("Missing GEMINI_API_KEY environment variable.");
+  constructor() {
+    const apiKey = process.env.GEMINI_API_KEY;
+    this.modelName = process.env.GEMINI_MODEL || "gemini-2.0-flash";
+    if (apiKey && apiKey.trim().length > 10) {
+      this.genAI = new GoogleGenerativeAI(apiKey.trim());
     }
-    // In real implementation: this.client = new GoogleGenAI({ apiKey: this.config.apiKey });
   }
 
-  /**
-   * Sends a structured prompt to Gemini requesting a JSON output matching a Zod schema.
-   * Mitigates hallucinations by passing schema definitions and strict temperature settings.
-   * 
-   * @param prompt - Main user prompt
-   * @param systemInstruction - Background instructions/rules
-   * @param responseSchema - ZodSchema for JSON constraints
-   * @returns Promise<T> Parsed JSON object matching the schema
-   */
-  public async generateStructuredJSON<T>(
-    prompt: string,
-    systemInstruction: string,
-    responseSchema: ZodSchema<T>
-  ): Promise<T> {
-    let attempts = 0;
-    const delay = (ms: number) => new Promise(res => setTimeout(res, ms));
+  public isAvailable(): boolean {
+    return this.genAI !== null;
+  }
 
-    while (attempts < this.config.maxRetries) {
-      try {
-        attempts++;
-        
-        // Simulating the Gemini SDK generateContent call:
-        // const model = this.client.getGenerativeModel({ 
-        //   model: this.config.defaultModel,
-        //   generationConfig: {
-        //     responseMimeType: "application/json",
-        //     responseSchema: responseSchema,
-        //     temperature: 0.1 // Low temperature to reduce hallucination
-        //   },
-        //   systemInstruction
-        // });
-        // const result = await model.generateContent(prompt);
-        // return JSON.parse(result.response.text()) as T;
-        
-        throw new Error("Use fallback mock since this is a scaffold.");
-      } catch (error) {
-        if (attempts >= this.config.maxRetries) {
-          throw new Error(`Gemini generateStructuredJSON failed after ${attempts} retries: ${error}`);
-        }
-        // Exponential Backoff
-        await delay(Math.pow(2, attempts) * 1000);
-      }
+  public async analyzeCandidate(
+    resumeText: string,
+    githubMetrics: any,
+    systemPrompt: string
+  ): Promise<Partial<AuditReport>> {
+    if (!this.genAI) {
+      throw new Error("GEMINI_API_KEY is not configured.");
     }
 
-    throw new Error("Gemini generation exhaustively failed.");
+    console.log(`[Gemini AI] Sending analysis request to ${this.modelName}...`);
+
+    const model = this.genAI.getGenerativeModel({
+      model: this.modelName,
+      systemInstruction: systemPrompt,
+      generationConfig: {
+        temperature: 0.1,
+        responseMimeType: "application/json",
+      },
+    });
+
+    const userPrompt = `RESUME:\n${compactResumeText(resumeText, 8000)}\n\nGITHUB:\n${JSON.stringify(
+      compactGithubForGemini(githubMetrics)
+    )}`;
+
+    const result = await model.generateContent(userPrompt);
+    const text = result.response.text();
+    if (!text) {
+      throw new Error("Gemini returned an empty response.");
+    }
+
+    const cleaned = text.replace(/^```json\s*/i, "").replace(/```$/i, "").trim();
+    return JSON.parse(cleaned) as Partial<AuditReport>;
+  }
+
+  public async generateProfessionalReport(data: any): Promise<any> {
+    if (!this.genAI) {
+      throw new Error("GEMINI_API_KEY is not configured.");
+    }
+
+    console.log(`[Gemini AI] Generating professional verification report via ${this.modelName}...`);
+
+    const systemPrompt = `You are an expert technical recruiter and auditor. Generate a concise structured JSON report for a Handlebars PDF template with keys: executiveSummary, resumeVerificationDashboard { claimedSkillsCount, verifiedSkillsCount, unverifiedSkillsCount, falselyClaimedSkills, verificationCoverage }, githubVerificationDashboard { repositoryCount, verifiedTechnologies, ownershipScore, activityScore, certificateStatus, languagesUsed }, githubAnalysisSummary, riskIndicators, certificateVerificationDashboard, finalHiringRecommendation.`;
+
+    const model = this.genAI.getGenerativeModel({
+      model: this.modelName,
+      systemInstruction: systemPrompt,
+      generationConfig: {
+        temperature: 0.1,
+        responseMimeType: "application/json",
+      },
+    });
+
+    const result = await model.generateContent(`CANDIDATE DATA:\n${JSON.stringify(data)}`);
+    const text = result.response.text();
+    const cleaned = text.replace(/^```json\s*/i, "").replace(/```$/i, "").trim();
+    return JSON.parse(cleaned);
   }
 }
